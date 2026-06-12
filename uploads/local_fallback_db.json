@@ -1,0 +1,24 @@
+{
+  "clients": {},
+  "monthly_packages": {},
+  "activities": {},
+  "activity_files": {},
+  "users": {
+    "u1": {
+      "name": "Sarah Jenkins",
+      "email": "admin@agency.com",
+      "role": "Admin",
+      "is_deleted": false,
+      "deleted_at": null,
+      "created_at": "2026-06-10T09:09:25.948Z"
+    },
+    "u2": {
+      "name": "Alex Rivera",
+      "email": "manager@agency.com",
+      "role": "Manager",
+      "is_deleted": false,
+      "deleted_at": null,
+      "created_at": "2026-06-10T09:09:25.949Z"
+    }
+  }
+}

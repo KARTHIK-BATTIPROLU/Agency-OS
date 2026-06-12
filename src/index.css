@@ -1,0 +1,19 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+/* Custom minimal focus ring and scrollbars for our sleek agency UI */
+*:focus-visible {
+  outline: 2px solid var(--color-neutral-900);
+  outline-offset: 2px;
+}
+
+body {
+  background-color: #fafafa;
+  color: #171717;
+  font-family: var(--font-sans);
+}
