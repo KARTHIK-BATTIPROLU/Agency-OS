@@ -92,28 +92,33 @@ const firebaseCredential = serviceAccountRaw
   ? admin.credential.cert(JSON.parse(Buffer.from(serviceAccountRaw, 'base64').toString('utf8')))
   : admin.credential.applicationDefault();
 
+// Everything (Auth, Firestore, Storage) lives in this single Firebase project.
+// firebase-applet-config.json points at a separate AI-Studio-provisioned
+// project (gen-lang-client-...) that isn't reachable with this credential —
+// ignored here in favor of one project end to end.
+const AUTH_PROJECT_ID = process.env.FIREBASE_AUTH_PROJECT_ID || firebaseConfig.projectId;
+
 if (!admin.apps.length) {
   try {
     admin.initializeApp({
       credential: firebaseCredential,
-      projectId: firebaseConfig.projectId,
+      projectId: AUTH_PROJECT_ID,
       storageBucket: process.env.FIREBASE_STORAGE_BUCKET || firebaseConfig.storageBucket,
     });
-    console.log('Firebase Admin initialized with project:', firebaseConfig.projectId);
+    console.log('Firebase Admin initialized with project:', AUTH_PROJECT_ID);
   } catch (error) {
     console.error('Firebase Admin initialization failed:', error);
   }
 }
 
-const rawDb = firebaseConfig.firestoreDatabaseId
-  ? getFirestore(admin.apps[0] || admin.app(), firebaseConfig.firestoreDatabaseId)
-  : getFirestore();
+// Use this project's default Firestore database — the named database id in
+// firebase-applet-config.json belongs to the other (unreachable) project.
+const rawDb = getFirestore();
 
 // --- FIREBASE AUTH TOKEN VERIFICATION ---
-// Authentication is handled by a dedicated Firebase project (email/password).
-// We register a separate admin app pinned to that project so verifyIdToken()
-// validates the token audience correctly.
-const AUTH_PROJECT_ID = process.env.FIREBASE_AUTH_PROJECT_ID || firebaseConfig.projectId;
+// The main app above already targets the auth project, so this second named
+// app is only kept in case FIREBASE_AUTH_PROJECT_ID is ever pointed at a
+// different project again — today it's the same project as the main app.
 let authApp: admin.app.App;
 try {
   authApp = admin.app('authApp');
