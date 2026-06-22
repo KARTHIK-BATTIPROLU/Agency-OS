@@ -7,6 +7,7 @@ import multer from 'multer';
 import admin from 'firebase-admin';
 import { getFirestore } from 'firebase-admin/firestore';
 import { MongoClient, Db as MongoDb } from 'mongodb';
+import { getStorage } from 'firebase-admin/storage';
 import { createServer as createViteServer } from 'vite';
 
 // Suppress experimental warnings if any
@@ -14,7 +15,55 @@ process.removeAllListeners('warning');
 
 // Initialize Express app
 const app = express();
-const PORT = 3000;
+// Render (and most PaaS hosts) inject the port to bind on via process.env.PORT.
+// Fall back to 3000 for local development.
+const PORT = Number(process.env.PORT) || 3000;
+
+// --- CORS ---
+// Allow the frontend (local dev + Netlify deployment) to call this API directly.
+// Origins can be supplied as a comma-separated FRONTEND_ORIGINS env var; the
+// localhost dev origins are always permitted. Set FRONTEND_ORIGINS="*" to allow
+// any origin (handy while wiring up a first deploy).
+const DEFAULT_ALLOWED_ORIGINS = [
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:5173',
+];
+const envOrigins = (process.env.FRONTEND_ORIGINS || '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+const allowAnyOrigin = envOrigins.includes('*');
+const allowedOrigins = new Set([...DEFAULT_ALLOWED_ORIGINS, ...envOrigins]);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && (allowAnyOrigin || allowedOrigins.has(origin))) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Vary', 'Origin');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+    res.header(
+      'Access-Control-Allow-Headers',
+      'Origin, X-Requested-With, Content-Type, Accept, Authorization'
+    );
+  }
+  // Short-circuit CORS preflight requests.
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
+// --- HEALTH CHECK ---
+// Lightweight liveness probe for uptime monitors (e.g. UptimeRobot keeping the
+// Render free instance warm). Declared before express.json(), the DB proxies,
+// auth, and any other middleware so it returns instantly with no I/O. Pings to
+// this path are intentionally not logged.
+app.get('/api/health', (req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
 app.use(express.json());
 
@@ -32,19 +81,25 @@ if (fs.existsSync(firebaseConfigPath)) {
   }
 }
 
-// In case the project is running with ambient google application credentials, initialize.
-// If we can use the default or a specified config, do it cleanly.
+// --- FIREBASE ADMIN CREDENTIALS ---
+// admin.initializeApp() with no `credential` falls back to Application Default
+// Credentials, which only resolves automatically on Google Cloud (via the
+// metadata service). Off-GCP hosts (Render, Railway, etc.) need an explicit
+// service account. Provide one via FIREBASE_SERVICE_ACCOUNT (base64 JSON);
+// applicationDefault() remains the fallback for GCP-hosted/local-gcloud setups.
+const serviceAccountRaw = process.env.FIREBASE_SERVICE_ACCOUNT;
+const firebaseCredential = serviceAccountRaw
+  ? admin.credential.cert(JSON.parse(Buffer.from(serviceAccountRaw, 'base64').toString('utf8')))
+  : admin.credential.applicationDefault();
+
 if (!admin.apps.length) {
   try {
-    if (firebaseConfig.projectId) {
-      admin.initializeApp({
-        projectId: firebaseConfig.projectId
-      });
-      console.log('Firebase Admin initialized with project:', firebaseConfig.projectId);
-    } else {
-      admin.initializeApp();
-      console.log('Firebase Admin initialized with default credentials.');
-    }
+    admin.initializeApp({
+      credential: firebaseCredential,
+      projectId: firebaseConfig.projectId,
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET || firebaseConfig.storageBucket,
+    });
+    console.log('Firebase Admin initialized with project:', firebaseConfig.projectId);
   } catch (error) {
     console.error('Firebase Admin initialization failed:', error);
   }
@@ -57,16 +112,33 @@ const rawDb = firebaseConfig.firestoreDatabaseId
 // --- FIREBASE AUTH TOKEN VERIFICATION ---
 // Authentication is handled by a dedicated Firebase project (email/password).
 // We register a separate admin app pinned to that project so verifyIdToken()
-// validates the token audience correctly. No service-account credentials are
-// required for token verification — only the project id.
+// validates the token audience correctly.
 const AUTH_PROJECT_ID = process.env.FIREBASE_AUTH_PROJECT_ID || firebaseConfig.projectId;
 let authApp: admin.app.App;
 try {
   authApp = admin.app('authApp');
 } catch {
-  authApp = admin.initializeApp({ projectId: AUTH_PROJECT_ID }, 'authApp');
+  authApp = admin.initializeApp({ credential: firebaseCredential, projectId: AUTH_PROJECT_ID }, 'authApp');
 }
 const firebaseAuth = admin.auth(authApp);
+
+// --- REQUIRE AUTH MIDDLEWARE ---
+// Every /api/* route (other than the health check registered above) needs a
+// valid Firebase ID token. Without this, all CRUD endpoints — including the
+// destructive ones — were reachable by anyone with the URL.
+async function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!token) {
+    return res.status(401).json({ error: 'Missing bearer token' });
+  }
+  try {
+    (req as any).firebaseUser = await firebaseAuth.verifyIdToken(token);
+    next();
+  } catch (err: any) {
+    res.status(401).json({ error: 'Invalid or expired token', details: err.message });
+  }
+}
 
 // --- MONGODB (USER / DATA STORE) ---
 const MONGODB_URI = process.env.MONGODB_URI || '';
@@ -155,6 +227,11 @@ async function seedMongoUsers() {
 }
 
 // --- RESILIENT DUAL-WRITE DATABASE PROXY ---
+// In production, a Firestore failure must surface as a real error instead of
+// silently switching to a local JSON file — Render/Railway's filesystem is
+// wiped on every redeploy, so the fallback would both lose data and mask the
+// real problem. The fallback only activates outside production.
+const FALLBACK_ENABLED = process.env.NODE_ENV !== 'production';
 let useLocalFallback = false;
 
 class LocalDatabaseFallback {
@@ -252,6 +329,15 @@ async function testDbAccess() {
     console.log('Successfully connected to remote Firestore. Using remote DB.');
     useLocalFallback = false;
   } catch (err: any) {
+    if (!FALLBACK_ENABLED) {
+      // This is a fire-and-forget boot-time probe, not an awaited request —
+      // throwing here would be an unhandled rejection that crashes the whole
+      // process. Log loudly instead; every route already has its own
+      // try/catch around Firestore calls and will surface this same error
+      // as a normal 500 per request until it's fixed.
+      console.error('Firestore connectivity check failed. API requests will fail until this is resolved:', err.message || err);
+      return;
+    }
     console.warn('Remote Firestore is not ready yet (IAM Sync delay). Using local JSON fallback DB:', err.message || err);
     useLocalFallback = true;
   }
@@ -268,6 +354,7 @@ const db = {
               try {
                 return await rawDb.collection(collectionName).where(field, op, val).get();
               } catch (err) {
+                if (!FALLBACK_ENABLED) throw err;
                 console.warn(`Firestore where().get() failed, falling back:`, err);
                 useLocalFallback = true;
               }
@@ -315,6 +402,7 @@ const db = {
               try {
                 return await rawDb.collection(collectionName).limit(val).get();
               } catch (err) {
+                if (!FALLBACK_ENABLED) throw err;
                 console.warn(`Firestore limit().get() failed, falling back:`, err);
                 useLocalFallback = true;
               }
@@ -351,6 +439,7 @@ const db = {
           try {
             return await rawDb.collection(collectionName).get();
           } catch (err) {
+            if (!FALLBACK_ENABLED) throw err;
             console.warn(`Firestore get() failed, falling back:`, err);
             useLocalFallback = true;
           }
@@ -387,6 +476,7 @@ const db = {
               try {
                 return await rawDb.collection(collectionName).doc(docId).get();
               } catch (err) {
+                if (!FALLBACK_ENABLED) throw err;
                 console.warn(`Firestore doc().get() failed, falling back:`, err);
                 useLocalFallback = true;
               }
@@ -411,11 +501,12 @@ const db = {
             };
           },
           set: async (data: any) => {
-            localDb.setDocument(collectionName, docId, data);
+            if (FALLBACK_ENABLED) localDb.setDocument(collectionName, docId, data);
             if (!useLocalFallback) {
               try {
                 await rawDb.collection(collectionName).doc(docId).set(data);
               } catch (err) {
+                if (!FALLBACK_ENABLED) throw err;
                 console.warn(`Firestore doc().set() failed, using fallback:`, err);
                 useLocalFallback = true;
               }
@@ -423,11 +514,12 @@ const db = {
             return { success: true };
           },
           update: async (data: any) => {
-            localDb.updateDocument(collectionName, docId, data);
+            if (FALLBACK_ENABLED) localDb.updateDocument(collectionName, docId, data);
             if (!useLocalFallback) {
               try {
                 await rawDb.collection(collectionName).doc(docId).update(data);
               } catch (err) {
+                if (!FALLBACK_ENABLED) throw err;
                 console.warn(`Firestore doc().update() failed, using fallback:`, err);
                 useLocalFallback = true;
               }
@@ -435,11 +527,12 @@ const db = {
             return { success: true };
           },
           delete: async () => {
-            localDb.deleteDocument(collectionName, docId);
+            if (FALLBACK_ENABLED) localDb.deleteDocument(collectionName, docId);
             if (!useLocalFallback) {
               try {
                 await rawDb.collection(collectionName).doc(docId).delete();
               } catch (err) {
+                if (!FALLBACK_ENABLED) throw err;
                 console.warn(`Firestore doc().delete() failed, using fallback:`, err);
                 useLocalFallback = true;
               }
@@ -451,12 +544,6 @@ const db = {
     };
   }
 };
-
-// Ensure uploads folder exists
-const uploadsBasePath = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsBasePath)) {
-  fs.mkdirSync(uploadsBasePath, { recursive: true });
-}
 
 // Configure multer storage and validation
 const fileFilter = (req: any, file: Express.Multer.File, cb: any) => {
@@ -510,53 +597,17 @@ const typeMapping: Record<string, string> = {
   'Website Update': 'website-updates'
 };
 
-// Multer disk destination setup
-const storage = multer.diskStorage({
-  destination: async (req, file, cb) => {
-    try {
-      const clientId = req.query.clientId as string;
-      const activityType = (req.query.activityType as string) || 'general';
-
-      let clientNameSlug = 'unnamed-client';
-      if (clientId) {
-        const clientDoc = await db.collection('clients').doc(clientId).get();
-        if (clientDoc.exists) {
-          const clientData = clientDoc.data();
-          if (clientData?.client_name) {
-            clientNameSlug = slugify(clientData.client_name);
-          }
-        }
-      }
-
-      const folderName = typeMapping[activityType] || slugify(activityType);
-      const targetDir = path.join(uploadsBasePath, 'clients', clientNameSlug, folderName);
-
-      // Recursive mkdir structure
-      fs.mkdirSync(targetDir, { recursive: true });
-      cb(null, targetDir);
-    } catch (err: any) {
-      cb(err, '');
-    }
-  },
-  filename: (req, file, cb) => {
-    // Generate secure clean unique filename
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    const ext = path.extname(file.originalname);
-    const cleanBaseName = file.originalname.replace(ext, '').replace(/[^a-zA-Z0-9]/g, '_');
-    cb(null, `${cleanBaseName}-${uniqueSuffix}${ext}`);
-  }
-});
-
-const upload = multer({ 
-  storage, 
+// Files are buffered in memory then streamed straight to Firebase Storage —
+// Render/Railway's local disk is wiped on every redeploy, so writing to disk
+// here would lose every uploaded file on the next deploy/restart.
+const upload = multer({
+  storage: multer.memoryStorage(),
   fileFilter,
   limits: { fileSize: 100 * 1024 * 1024 } // Maximum 100MB per file
 });
 
-// Serve local static uploaded files directly
-app.use('/uploads', express.static(uploadsBasePath));
-
 // --- API ROUTES ---
+app.use('/api', requireAuth);
 
 // 1. CLIENTS CRUD
 // Read all non-deleted
@@ -880,6 +931,7 @@ app.post('/api/activities', async (req, res) => {
           activity_id: id,
           file_name: file.file_name,
           file_path: file.file_path,
+          storage_path: file.storage_path || null,
           file_type: file.file_type,
           uploaded_at: new Date().toISOString()
         };
@@ -922,6 +974,7 @@ app.put('/api/activities/:id', async (req, res) => {
             activity_id: id,
             file_name: file.file_name,
             file_path: file.file_path,
+            storage_path: file.storage_path || null,
             file_type: file.file_type,
             uploaded_at: new Date().toISOString()
           };
@@ -1350,11 +1403,12 @@ app.delete('/api/files/:id', async (req, res) => {
     const fileDoc = await db.collection('activity_files').doc(id).get();
     if (fileDoc.exists) {
       const docData = fileDoc.data();
-      // Remove file from disk
-      if (docData?.file_path) {
-        const fullDiskPath = path.join(__dirname, docData.file_path);
-        if (fs.existsSync(fullDiskPath)) {
-          fs.unlinkSync(fullDiskPath);
+      // Remove the object from Firebase Storage
+      if (docData?.storage_path) {
+        try {
+          await getStorage().bucket().file(docData.storage_path).delete();
+        } catch (err) {
+          console.warn(`Could not delete storage object ${docData.storage_path}:`, err);
         }
       }
       await db.collection('activity_files').doc(id).delete();
@@ -1367,6 +1421,9 @@ app.delete('/api/files/:id', async (req, res) => {
 
 
 // 6. GENERAL FILE UPLOAD API
+// Files are buffered in memory by multer (see `upload` above) and streamed
+// straight to Firebase Storage — local disk does not survive a Render/Railway
+// redeploy, so files are never written to this server's filesystem.
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
@@ -1388,13 +1445,19 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     }
 
     const folderName = typeMapping[activityType] || slugify(activityType);
-    
-    // Build path matching exactly: /uploads/clients/{client-name}/{activity-type}/filename
-    const webPath = `/uploads/clients/${clientSlugName}/${folderName}/${req.file.filename}`;
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const ext = path.extname(req.file.originalname);
+    const cleanBaseName = req.file.originalname.replace(ext, '').replace(/[^a-zA-Z0-9]/g, '_');
+    const storagePath = `clients/${clientSlugName}/${folderName}/${cleanBaseName}-${uniqueSuffix}${ext}`;
+
+    const bucketFile = getStorage().bucket().file(storagePath);
+    await bucketFile.save(req.file.buffer, { contentType: req.file.mimetype });
+    const [url] = await bucketFile.getSignedUrl({ action: 'read', expires: Date.now() + 1000 * 60 * 60 * 24 * 365 * 10 });
 
     res.json({
       file_name: req.file.originalname,
-      file_path: webPath,
+      file_path: url,
+      storage_path: storagePath,
       file_type: req.file.mimetype
     });
   } catch (error: any) {
@@ -1404,10 +1467,13 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 
 
 // 7. SYSTEM DATABASE RESET
+// Wipes every collection. Too destructive to expose in production regardless
+// of auth — disabled there entirely rather than just access-controlled.
 app.post('/api/reset', async (req, res) => {
+  if (process.env.NODE_ENV === 'production') return res.status(404).end();
   try {
     console.log('Failsafe Database Reset triggered...');
-    
+
     // Delete clients
     const clientsRef = await db.collection('clients').get();
     const clientPromises = clientsRef.docs.map(doc => doc.ref.delete());

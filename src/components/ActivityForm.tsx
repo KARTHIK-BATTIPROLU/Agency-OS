@@ -1,13 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Activity, ActivityType, Client, ACTIVITY_CONFIGS, UserRole } from '../types';
 import { Plus, X, Link, HelpCircle, Check, Loader2, Upload, FileText, Trash2, Video, ImageIcon } from 'lucide-react';
+import { apiFetch } from '../lib/api';
 
 interface ActivityFormProps {
   clients: Client[];
   currentRole: UserRole;
   currentUsername: string;
   activityToEdit?: Activity | null;
-  onSave: (activity: Omit<Activity, 'id' | 'created_at'> & { id?: string, attached_files?: Array<{ file_name: string, file_path: string, file_type: string, is_new?: boolean }> }) => void;
+  onSave: (activity: Omit<Activity, 'id' | 'created_at'> & { id?: string, attached_files?: Array<{ file_name: string, file_path: string, storage_path?: string, file_type: string, is_new?: boolean }> }) => void;
   onCancel: () => void;
   preselectedClientId?: string;
 }
@@ -48,7 +49,7 @@ export default function ActivityForm({
   const [isDragging, setIsDragging] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState('');
-  const [attachedFiles, setAttachedFiles] = useState<Array<{ id?: string, file_name: string, file_path: string, file_type: string, is_new?: boolean }>>([]);
+  const [attachedFiles, setAttachedFiles] = useState<Array<{ id?: string, file_name: string, file_path: string, storage_path?: string, file_type: string, is_new?: boolean }>>([]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -135,7 +136,7 @@ export default function ActivityForm({
     formData.append('file', file);
 
     try {
-      const response = await fetch(`/api/upload?clientId=${clientId}&activityType=${activityType}`, {
+      const response = await apiFetch(`/api/upload?clientId=${clientId}&activityType=${activityType}`, {
         method: 'POST',
         body: formData
       });
@@ -159,7 +160,7 @@ export default function ActivityForm({
     if (id) {
       // Direct database attachment deletion
       try {
-        const response = await fetch(`/api/files/${id}`, {
+        const response = await apiFetch(`/api/files/${id}`, {
           method: 'DELETE'
         });
         if (!response.ok) {
@@ -210,6 +211,7 @@ export default function ActivityForm({
       attached_files: attachedFiles.map(f => ({
         file_name: f.file_name,
         file_path: f.file_path,
+        storage_path: f.storage_path,
         file_type: f.file_type,
         is_new: f.is_new
       }))

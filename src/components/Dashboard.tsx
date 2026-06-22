@@ -632,7 +632,7 @@ export default function Dashboard({
                             <React.Fragment key={file.id || fIdx}>
                               <span>•</span>
                               <a
-                                href={`/uploads/${file.file_path}`}
+                                href={file.file_path}
                                 download={file.file_name}
                                 target="_blank"
                                 referrerPolicy="no-referrer"
@@ -864,7 +864,7 @@ export default function Dashboard({
                             <React.Fragment key={file.id || fIdx}>
                               <span>•</span>
                               <a
-                                href={`/uploads/${file.file_path}`}
+                                href={file.file_path}
                                 download={file.file_name}
                                 target="_blank"
                                 referrerPolicy="no-referrer"
@@ -1063,7 +1063,7 @@ export default function Dashboard({
                               {act.files && act.files.map((file, fIdx) => (
                                 <a
                                   key={file.id || fIdx}
-                                  href={`/uploads/${file.file_path}`}
+                                  href={file.file_path}
                                   download={file.file_name}
                                   target="_blank"
                                   referrerPolicy="no-referrer"

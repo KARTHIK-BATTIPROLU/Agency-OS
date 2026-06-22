@@ -1,0 +1,30 @@
+# Render blueprint for the Agency OS backend (Express API).
+# Deploy via Render Dashboard > New > Blueprint, or set these manually.
+services:
+  - type: web
+    name: agency-os-api
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build:server
+    startCommand: node dist/server.cjs
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_DB
+        value: agency_os
+      # Secrets — set these in the Render dashboard (do not commit values).
+      - key: MONGODB_URI
+        sync: false
+      - key: FIREBASE_AUTH_PROJECT_ID
+        sync: false
+      # Base64-encoded Firebase service account JSON. Required off-GCP so
+      # firebase-admin can authenticate to Firestore/Storage/Auth.
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
+      - key: FIREBASE_STORAGE_BUCKET
+        sync: false
+      # Comma-separated list of allowed browser origins for direct CORS calls,
+      # e.g. https://your-site.netlify.app — never set to "*" in production.
+      - key: FRONTEND_ORIGINS
+        sync: false

@@ -66,6 +66,7 @@ export interface ActivityFile {
   activity_id: string;
   file_name: string;
   file_path: string;
+  storage_path?: string;
   file_type: string;
   uploaded_at: string;
 }

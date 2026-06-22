@@ -1,0 +1,20 @@
+# Netlify configuration for the Agency OS frontend.
+#
+# The React app calls the backend via an absolute URL (VITE_API_URL, baked in
+# at build time through src/lib/api.ts) rather than a same-origin proxy, since
+# the backend lives on a different domain (Render). Set VITE_API_URL in the
+# Netlify site's environment variables before building.
+
+[build]
+  command = "npm run build:client"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# SPA fallback: the app has no client-side router, but this keeps direct/
+# refreshed hits on any non-asset path resolving to index.html.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

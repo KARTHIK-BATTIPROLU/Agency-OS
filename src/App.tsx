@@ -10,6 +10,7 @@ import ApprovalsTab from './components/ApprovalsTab';
 import InvoicesTab from './components/InvoicesTab';
 import { auth } from './firebase';
 import { onAuthStateChanged, signOut, User as FirebaseUser } from 'firebase/auth';
+import { apiFetch } from './lib/api';
 import {
   Activity as ActivityIcon, Users, FileSpreadsheet, Settings,
   Plus, CheckSquare, Sparkles, LogIn, LogOut, ChevronRight, UserCheck,
@@ -51,10 +52,10 @@ export default function App() {
     try {
       setErrorText('');
       const [clientsRes, packagesRes, activitiesRes, usersRes] = await Promise.all([
-        fetch('/api/clients/all'), // Get all including soft deleted for restoration
-        fetch('/api/packages/all'),
-        fetch('/api/activities/all'),
-        fetch('/api/users/all')
+        apiFetch('/api/clients/all'), // Get all including soft deleted for restoration
+        apiFetch('/api/packages/all'),
+        apiFetch('/api/activities/all'),
+        apiFetch('/api/users/all')
       ]);
 
       const failedEndpoints: string[] = [];
@@ -98,10 +99,7 @@ export default function App() {
       try {
         const idToken = await auth.currentUser?.getIdToken();
         if (idToken) {
-          const meRes = await fetch('/api/auth/me', {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${idToken}` },
-          });
+          const meRes = await apiFetch('/api/auth/me', { method: 'POST' });
           if (meRes.ok) {
             const me = await meRes.json();
             setCurrentUser(me);
@@ -120,8 +118,8 @@ export default function App() {
       // a failure here must not break the core Firestore-backed dashboard.
       try {
         const [tasksRes, invoicesRes] = await Promise.all([
-          fetch('/api/tasks/all'),
-          fetch('/api/invoices/all'),
+          apiFetch('/api/tasks/all'),
+          apiFetch('/api/invoices/all'),
         ]);
         if (tasksRes.ok) setTasks(await tasksRes.json());
         if (invoicesRes.ok) setInvoices(await invoicesRes.json());
@@ -188,13 +186,12 @@ export default function App() {
   };
 
   // Deliverable Activity actions (Create / Edit)
-  const handleSaveActivity = async (activityData: Omit<Activity, 'id' | 'created_at'> & { id?: string, attached_files?: Array<{ file_name: string, file_path: string, file_type: string, is_new?: boolean }> }) => {
+  const handleSaveActivity = async (activityData: Omit<Activity, 'id' | 'created_at'> & { id?: string, attached_files?: Array<{ file_name: string, file_path: string, storage_path?: string, file_type: string, is_new?: boolean }> }) => {
     try {
       setLoading(true);
       const isEdit = !!activityData.id;
-      const response = await fetch('/api/activities', {
+      const response = await apiFetch('/api/activities', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(activityData)
       });
 
@@ -220,7 +217,7 @@ export default function App() {
   const handleDeleteActivity = async (id: string) => {
     try {
       setLoading(true);
-      const response = await fetch(`/api/activities/${id}`, {
+      const response = await apiFetch(`/api/activities/${id}`, {
         method: 'DELETE'
       });
       if (!response.ok) {
@@ -237,9 +234,8 @@ export default function App() {
   const handleSaveTask = async (taskData: Partial<Task>) => {
     try {
       const payload = { ...taskData, created_by: taskData.created_by || currentUser?.name || 'system' };
-      const response = await fetch('/api/tasks', {
+      const response = await apiFetch('/api/tasks', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
       if (!response.ok) {
@@ -254,7 +250,7 @@ export default function App() {
 
   const handleDeleteTask = async (id: string) => {
     try {
-      const response = await fetch(`/api/tasks/${id}`, { method: 'DELETE' });
+      const response = await apiFetch(`/api/tasks/${id}`, { method: 'DELETE' });
       if (!response.ok) throw new Error('API request failed');
       await loadAllData();
     } catch (err: any) {
@@ -264,9 +260,8 @@ export default function App() {
 
   const handleTaskApproval = async (id: string, stage: string, note?: string) => {
     try {
-      const response = await fetch(`/api/tasks/${id}/approval`, {
+      const response = await apiFetch(`/api/tasks/${id}/approval`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ stage, note, by: currentUser?.name || 'system' }),
       });
       if (!response.ok) {
@@ -283,9 +278,8 @@ export default function App() {
   const handleSaveInvoice = async (invoiceData: Partial<Invoice>) => {
     try {
       const payload = { ...invoiceData, created_by: invoiceData.created_by || currentUser?.name || 'system' };
-      const response = await fetch('/api/invoices', {
+      const response = await apiFetch('/api/invoices', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
       if (!response.ok) {
@@ -300,7 +294,7 @@ export default function App() {
 
   const handleDeleteInvoice = async (id: string) => {
     try {
-      const response = await fetch(`/api/invoices/${id}`, { method: 'DELETE' });
+      const response = await apiFetch(`/api/invoices/${id}`, { method: 'DELETE' });
       if (!response.ok) throw new Error('API request failed');
       await loadAllData();
     } catch (err: any) {
@@ -310,9 +304,8 @@ export default function App() {
 
   const handleRecordPayment = async (id: string, payment: { amount: number; date?: string; method?: string; note?: string }) => {
     try {
-      const response = await fetch(`/api/invoices/${id}/payments`, {
+      const response = await apiFetch(`/api/invoices/${id}/payments`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payment),
       });
       if (!response.ok) {
@@ -329,9 +322,8 @@ export default function App() {
   const handleSaveClient = async (clientData: Omit<Client, 'created_at'> & { id?: string }) => {
     try {
       setLoading(true);
-      const response = await fetch('/api/clients', {
+      const response = await apiFetch('/api/clients', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(clientData)
       });
 
@@ -349,7 +341,7 @@ export default function App() {
   const handleDeleteClient = async (clientId: string) => {
     try {
       setLoading(true);
-      const response = await fetch(`/api/clients/${clientId}`, {
+      const response = await apiFetch(`/api/clients/${clientId}`, {
         method: 'DELETE'
       });
       if (!response.ok) {
@@ -365,7 +357,7 @@ export default function App() {
   const handleRestoreClient = async (clientId: string) => {
     try {
       setLoading(true);
-      const response = await fetch(`/api/clients/${clientId}/restore`, {
+      const response = await apiFetch(`/api/clients/${clientId}/restore`, {
         method: 'POST'
       });
       if (!response.ok) {
@@ -382,9 +374,8 @@ export default function App() {
   const handleSavePackage = async (packageData: Omit<MonthlyPackage, 'created_at'> & { id?: string }) => {
     try {
       setLoading(true);
-      const response = await fetch('/api/packages', {
+      const response = await apiFetch('/api/packages', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(packageData)
       });
       if (!response.ok) {
@@ -403,9 +394,8 @@ export default function App() {
       setLoading(true);
       const isEdit = !!userData.id;
       const url = isEdit ? `/api/users/${userData.id}` : '/api/users';
-      const response = await fetch(url, {
+      const response = await apiFetch(url, {
         method: isEdit ? 'PUT' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(userData)
       });
       if (!response.ok) {
@@ -425,7 +415,7 @@ export default function App() {
     }
     try {
       setLoading(true);
-      const response = await fetch(`/api/users/${userId}`, {
+      const response = await apiFetch(`/api/users/${userId}`, {
         method: 'DELETE'
       });
       if (!response.ok) {
@@ -441,7 +431,7 @@ export default function App() {
   const handleRestoreUser = async (userId: string) => {
     try {
       setLoading(true);
-      const response = await fetch(`/api/users/${userId}/restore`, {
+      const response = await apiFetch(`/api/users/${userId}/restore`, {
         method: 'POST'
       });
       if (!response.ok) {
@@ -459,7 +449,7 @@ export default function App() {
     if (confirm('Failsafe Check: Are you sure you want to restore a fresh empty database? Custom Clients, SLA Metrics, and logged Deliverables will be deleted.')) {
       try {
         setLoading(true);
-        const response = await fetch('/api/reset', {
+        const response = await apiFetch('/api/reset', {
           method: 'POST'
         });
         if (!response.ok) {
