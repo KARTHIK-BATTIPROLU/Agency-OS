@@ -1536,10 +1536,11 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    // This backend runs standalone in production (the frontend deploys
+    // separately to Netlify and is never built into dist/ on this host), so
+    // there's no SPA build to serve here — anything outside /api/* just 404s.
+    app.use((req, res) => {
+      res.status(404).json({ error: 'Not found' });
     });
   }
 
