@@ -656,25 +656,15 @@ app.post('/api/auth/me', async (req, res) => {
     }
 
     const usersColl = await mongoColl('users');
-    let user = await usersColl.findOne({ email });
+    const user = await usersColl.findOne({ email });
 
     if (!user) {
-      // First-time login for this Firebase account — provision a basic record.
-      // The very first account ever becomes Admin; subsequent ones are Managers.
-      const total = await usersColl.countDocuments();
-      const newUser = {
-        id: `u-${Date.now()}`,
-        name: decoded.name || email.split('@')[0],
-        email,
-        role: total === 0 ? 'Admin' : 'Manager',
-        firebase_uid: decoded.uid,
-        is_deleted: false,
-        deleted_at: null,
-        created_at: new Date().toISOString(),
-      };
-      await usersColl.insertOne(newUser as any);
-      user = newUser as any;
-    } else if (user.is_deleted) {
+      // The account record is created explicitly by /api/auth/signup at
+      // signup time, with the role the operator chose there. If it's
+      // missing, this Firebase identity never completed signup.
+      return res.status(404).json({ error: 'No account found for this identity. Please sign up.' });
+    }
+    if (user.is_deleted) {
       return res.status(403).json({ error: 'This account has been deactivated' });
     }
 
@@ -684,6 +674,74 @@ app.post('/api/auth/me', async (req, res) => {
       email: user.email,
       role: user.role,
       created_at: user.created_at,
+      is_deleted: false,
+    });
+  } catch (error: any) {
+    sendError(res, error);
+  }
+});
+
+// Provision the MongoDB account for a freshly-created Firebase identity.
+// The operator picks their role (Admin or Manager) on the signup form, and
+// that's the role this record is created with — there's no later upgrade
+// path other than an existing Admin editing the user record.
+app.post('/api/auth/signup', async (req, res) => {
+  try {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+    if (!token) {
+      return res.status(401).json({ error: 'Missing bearer token' });
+    }
+
+    let decoded;
+    try {
+      decoded = await firebaseAuth.verifyIdToken(token);
+    } catch (err: any) {
+      return res.status(401).json({ error: 'Invalid or expired token', details: err.message });
+    }
+
+    const email = (decoded.email || '').toLowerCase();
+    if (!email) {
+      return res.status(400).json({ error: 'Token has no email claim' });
+    }
+
+    const role = req.body?.role;
+    if (role !== 'Admin' && role !== 'Manager') {
+      return res.status(400).json({ error: "Role must be 'Admin' or 'Manager'" });
+    }
+
+    const usersColl = await mongoColl('users');
+    const existing = await usersColl.findOne({ email });
+    if (existing) {
+      // Idempotent: a retried signup call returns the record already made.
+      return res.json({
+        id: existing.id,
+        name: existing.name,
+        email: existing.email,
+        role: existing.role,
+        created_at: existing.created_at,
+        is_deleted: !!existing.is_deleted,
+      });
+    }
+
+    const newUser = {
+      id: `u-${Date.now()}`,
+      name: decoded.name || email.split('@')[0],
+      email,
+      role,
+      firebase_uid: decoded.uid,
+      is_deleted: false,
+      deleted_at: null,
+      created_at: new Date().toISOString(),
+    };
+    await usersColl.insertOne(newUser as any);
+
+    res.json({
+      id: newUser.id,
+      name: newUser.name,
+      email: newUser.email,
+      role: newUser.role,
+      created_at: newUser.created_at,
       is_deleted: false,
     });
   } catch (error: any) {

@@ -14,7 +14,7 @@ import { apiFetch } from './lib/api';
 import {
   Activity as ActivityIcon, Users, FileSpreadsheet, Settings,
   Plus, CheckSquare, Sparkles, LogIn, LogOut, ChevronRight, UserCheck,
-  HelpCircle, Menu, X, Landmark, RefreshCw, Loader2,
+  HelpCircle, Menu, X, Landmark, Loader2,
   ListChecks, GitPullRequest, Receipt
 } from 'lucide-react';
 
@@ -96,10 +96,17 @@ export default function App() {
 
       // Resolve the signed-in identity from MongoDB. The server verifies the
       // Firebase ID token and returns the matching user record (with role).
+      // Right after signup, the account-creation call on the login screen may
+      // not have finished writing the MongoDB record yet, so a 404 here is
+      // retried briefly before being treated as a real failure.
       try {
         const idToken = await auth.currentUser?.getIdToken();
         if (idToken) {
-          const meRes = await apiFetch('/api/auth/me', { method: 'POST' });
+          let meRes = await apiFetch('/api/auth/me', { method: 'POST' });
+          for (let attempt = 0; !meRes.ok && meRes.status === 404 && attempt < 3; attempt++) {
+            await new Promise((r) => setTimeout(r, 350));
+            meRes = await apiFetch('/api/auth/me', { method: 'POST' });
+          }
           if (meRes.ok) {
             const me = await meRes.json();
             setCurrentUser(me);
@@ -172,18 +179,6 @@ export default function App() {
       localStorage.setItem('agency_user_id_v2', currentUser.id);
     }
   }, [currentUser]);
-
-  // Swapping operational roles on-click
-  const handleToggleRole = () => {
-    if (!currentUser) return;
-    const oppositeRole = currentUser.role === 'Admin' ? 'Manager' : 'Admin';
-    const match = users.find(u => u.role === oppositeRole && !u.is_deleted);
-    if (match) {
-      setCurrentUser(match);
-    } else {
-      alert(`No team operator with standard rule ${oppositeRole} is active in our staff module.`);
-    }
-  };
 
   // Deliverable Activity actions (Create / Edit)
   const handleSaveActivity = async (activityData: Omit<Activity, 'id' | 'created_at'> & { id?: string, attached_files?: Array<{ file_name: string, file_path: string, storage_path?: string, file_type: string, is_new?: boolean }> }) => {
@@ -642,13 +637,6 @@ export default function App() {
           </button>
 
           <div className="px-6 py-6 mt-4 text-[10px] uppercase tracking-widest text-[#9ca3af] font-bold">OS Controls</div>
-          
-          <button
-            onClick={handleToggleRole}
-            className="w-full flex items-center px-6 py-2 text-xs font-semibold text-gray-505 hover:bg-gray-50 text-left transition-all cursor-pointer font-sans text-gray-500 font-bold"
-          >
-            <span className="mr-3">○</span> Switch View Role
-          </button>
 
           <button
             onClick={handleResetFailsafe}
@@ -783,15 +771,6 @@ export default function App() {
             <div className="pt-2 space-y-1">
               <button
                 onClick={() => {
-                  handleToggleRole();
-                  setMobileMenuOpen(false);
-                }}
-                className="w-full text-left py-2 px-3 rounded text-gray-400 flex items-center gap-2 font-sans text-xs font-semibold"
-              >
-                <span>○</span> Switch User Role ({currentUser?.role === 'Admin' ? 'MANAGER' : 'ADMIN'})
-              </button>
-              <button
-                onClick={() => {
                   handleResetFailsafe();
                   setMobileMenuOpen(false);
                 }}
@@ -814,15 +793,6 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-4">
-            {/* Switch view role toggle */}
-            <button
-              onClick={handleToggleRole}
-              className="hidden sm:flex items-center gap-1.5 bg-black hover:bg-gray-900 active:scale-95 text-white font-bold py-1.5 px-3 rounded text-[11px] font-mono cursor-pointer transition-all shadow-sm border border-black hover:border-gray-900"
-            >
-              <RefreshCw className="w-3.5 h-3.5 text-gray-300" />
-              SWITCH ROLE ({currentUser?.role === 'Admin' ? 'MANAGER' : 'ADMIN'})
-            </button>
-
             {/* Avatar block */}
             <div className="w-8 h-8 rounded-full bg-black text-white flex items-center justify-center border border-gray-300 font-bold font-mono text-xs uppercase flex-shrink-0 shadow-xs">
               {currentUser?.name.substring(0, 2) || 'OP'}
@@ -948,7 +918,6 @@ export default function App() {
               users={users}
               currentRole={currentUser.role}
               initialClientId={preselectedClientIdForConfig}
-              onToggleRole={handleToggleRole}
               onSaveClient={handleSaveClient}
               onDeleteClient={handleDeleteClient}
               onRestoreClient={handleRestoreClient}

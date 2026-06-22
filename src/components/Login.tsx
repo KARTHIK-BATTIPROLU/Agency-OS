@@ -3,10 +3,14 @@ import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   sendPasswordResetEmail,
+  signOut,
   AuthError,
 } from 'firebase/auth';
 import { auth } from '../firebase';
+import { apiFetch } from '../lib/api';
 import { Loader2, Lock, Mail, AlertTriangle } from 'lucide-react';
+
+type AuthRole = 'Admin' | 'Manager';
 
 // Maps Firebase auth error codes to operator-friendly copy.
 function describeAuthError(code: string): string {
@@ -33,6 +37,7 @@ function describeAuthError(code: string): string {
 }
 
 export default function Login() {
+  const [authRole, setAuthRole] = useState<AuthRole>('Manager');
   const [mode, setMode] = useState<'signin' | 'signup'>('signin');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -54,10 +59,25 @@ export default function Login() {
         await signInWithEmailAndPassword(auth, email.trim(), password);
       } else {
         await createUserWithEmailAndPassword(auth, email.trim(), password);
+        // The Firebase account now exists; provision its MongoDB record with
+        // the role chosen on this tab before the app shell reads /api/auth/me.
+        const signupRes = await apiFetch('/api/auth/signup', {
+          method: 'POST',
+          body: JSON.stringify({ role: authRole }),
+        });
+        if (!signupRes.ok) {
+          const data = await signupRes.json().catch(() => ({}));
+          await signOut(auth);
+          throw new Error(data.error || 'Could not finish creating your account.');
+        }
       }
       // On success the top-level auth listener swaps to the app shell.
     } catch (err) {
-      setError(describeAuthError((err as AuthError).code));
+      if (err instanceof Error && !(err as AuthError).code) {
+        setError(err.message);
+      } else {
+        setError(describeAuthError((err as AuthError).code));
+      }
     } finally {
       setSubmitting(false);
     }
@@ -92,11 +112,33 @@ export default function Login() {
           </div>
         </div>
 
+        {/* Admin / Manager role tab */}
+        <div className="flex mb-6 border border-gray-200 rounded overflow-hidden">
+          {(['Admin', 'Manager'] as AuthRole[]).map((r) => (
+            <button
+              key={r}
+              type="button"
+              onClick={() => {
+                setAuthRole(r);
+                setError('');
+                setNotice('');
+              }}
+              className={`flex-1 py-2 text-[11px] font-bold uppercase tracking-widest font-mono cursor-pointer transition-colors ${
+                authRole === r ? 'bg-black text-white' : 'bg-white text-gray-400 hover:text-black'
+              }`}
+            >
+              {r}
+            </button>
+          ))}
+        </div>
+
         <h2 className="text-lg font-bold mb-1">
-          {mode === 'signin' ? 'Sign in' : 'Create account'}
+          {mode === 'signin' ? `${authRole} sign in` : `Create ${authRole} account`}
         </h2>
         <p className="text-xs text-gray-500 mb-6 font-mono uppercase tracking-wide">
-          {mode === 'signin' ? 'Operator access required' : 'Register a new operator'}
+          {mode === 'signin'
+            ? authRole === 'Admin' ? 'Agency owner access' : 'Account manager access'
+            : authRole === 'Admin' ? 'Register a new agency owner' : 'Register a new account manager'}
         </p>
 
         <form onSubmit={handleSubmit} className="space-y-4">

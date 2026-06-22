@@ -16,7 +16,6 @@ interface ClientPackageConfigProps {
   onDeleteUser: (id: string) => void;
   onRestoreUser: (id: string) => void;
   initialClientId?: string;
-  onToggleRole?: () => void;
 }
 
 export default function ClientPackageConfig({
@@ -31,8 +30,7 @@ export default function ClientPackageConfig({
   onSaveUser,
   onDeleteUser,
   onRestoreUser,
-  initialClientId,
-  onToggleRole
+  initialClientId
 }: ClientPackageConfigProps) {
   const isAdmin = currentRole === 'Admin';
 
@@ -259,17 +257,8 @@ export default function ClientPackageConfig({
         <p className="text-xs text-gray-500 leading-relaxed font-sans">
           You are currently logged in as a <strong className="text-black">Social Media Manager</strong>. Managing client lifecycles, resetting databases, and configuring monthly targets is restricted to the <strong className="text-black">Admin (Agency Owner)</strong> role to protect target audit logs.
         </p>
-        {onToggleRole && (
-          <button
-            type="button"
-            onClick={onToggleRole}
-            className="w-full mt-2 bg-black hover:bg-neutral-800 text-white font-bold py-2 px-4 rounded text-xs font-mono uppercase tracking-wider cursor-pointer transition-colors shadow-xs"
-          >
-            Switch to Admin (Agency Owner) Role
-          </button>
-        )}
         <p className="text-[10px] text-gray-400 font-mono uppercase tracking-wider block pt-2 border-t border-gray-100">
-          Or toggle the active role in the desktop sidebar OS Controls list or mobile hamburger menu.
+          Contact an Admin if you need access to this section.
         </p>
       </div>
     );
