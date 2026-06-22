@@ -157,7 +157,10 @@ async function connectMongo(): Promise<MongoDb | null> {
     return null;
   }
   try {
-    const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 10000 });
+    // family: 4 forces IPv4 — on Render, IPv6/dual-stack DNS resolution to
+    // Atlas's SRV-resolved hosts can break the TLS handshake with exactly the
+    // "tlsv1 alert internal error" seen here; pinning to IPv4 avoids it.
+    const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 10000, family: 4 });
     await client.connect();
     mongoDb = client.db(MONGODB_DB);
     await mongoDb.collection('users').createIndex({ email: 1 }, { unique: true });
