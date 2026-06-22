@@ -18,10 +18,13 @@ services:
         sync: false
       - key: FIREBASE_AUTH_PROJECT_ID
         sync: false
-      # Base64-encoded Firebase service account JSON. Required off-GCP so
-      # firebase-admin can authenticate to Firestore/Storage/Auth.
+      # Base64-encoded service account JSON for the gen-lang-client-0563145298
+      # project (the Firestore data project) — required off-GCP so firebase-admin
+      # can authenticate to Firestore/Storage. Must NOT be the auth project's key.
       - key: FIREBASE_SERVICE_ACCOUNT
         sync: false
+      # Must match the same project as the service account above
+      # (gen-lang-client-0563145298.firebasestorage.app), not the auth project.
       - key: FIREBASE_STORAGE_BUCKET
         sync: false
       # Comma-separated list of allowed browser origins for direct CORS calls,
