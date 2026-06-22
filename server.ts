@@ -1,11 +1,8 @@
 import 'dotenv/config';
 import express from 'express';
 import path from 'path';
-import fs from 'fs';
-import dns from 'dns';
 import multer from 'multer';
 import admin from 'firebase-admin';
-import { getFirestore } from 'firebase-admin/firestore';
 import { MongoClient, Db as MongoDb } from 'mongodb';
 import { getStorage } from 'firebase-admin/storage';
 import { createServer as createViteServer } from 'vite';
@@ -58,30 +55,16 @@ app.use((req, res, next) => {
 
 // --- HEALTH CHECK ---
 // Lightweight liveness probe for uptime monitors (e.g. UptimeRobot keeping the
-// Render free instance warm). Declared before express.json(), the DB proxies,
-// auth, and any other middleware so it returns instantly with no I/O. Pings to
-// this path are intentionally not logged.
+// Render free instance warm). Declared before express.json(), auth, and any
+// other middleware so it returns instantly with no I/O. Pings to this path
+// are intentionally not logged.
 app.get('/api/health', (req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 app.use(express.json());
 
-// Setup relative path helpers
-const __dirname = path.resolve();
-
-// Read firebase config securely
-const firebaseConfigPath = path.join(__dirname, 'firebase-applet-config.json');
-let firebaseConfig: any = {};
-if (fs.existsSync(firebaseConfigPath)) {
-  try {
-    firebaseConfig = JSON.parse(fs.readFileSync(firebaseConfigPath, 'utf8'));
-  } catch (err) {
-    console.error('Error reading firebase-applet-config.json:', err);
-  }
-}
-
-// --- FIREBASE ADMIN CREDENTIALS ---
+// --- FIREBASE ADMIN CREDENTIALS (Auth + Storage only — no Firestore) ---
 // admin.initializeApp() with no `credential` falls back to Application Default
 // Credentials, which only resolves automatically on Google Cloud (via the
 // metadata service). Off-GCP hosts (Render, Railway, etc.) need an explicit
@@ -92,18 +75,14 @@ const firebaseCredential = serviceAccountRaw
   ? admin.credential.cert(JSON.parse(Buffer.from(serviceAccountRaw, 'base64').toString('utf8')))
   : admin.credential.applicationDefault();
 
-// Everything (Auth, Firestore, Storage) lives in this single Firebase project.
-// firebase-applet-config.json points at a separate AI-Studio-provisioned
-// project (gen-lang-client-...) that isn't reachable with this credential —
-// ignored here in favor of one project end to end.
-const AUTH_PROJECT_ID = process.env.FIREBASE_AUTH_PROJECT_ID || firebaseConfig.projectId;
+const AUTH_PROJECT_ID = process.env.FIREBASE_AUTH_PROJECT_ID;
 
 if (!admin.apps.length) {
   try {
     admin.initializeApp({
       credential: firebaseCredential,
       projectId: AUTH_PROJECT_ID,
-      storageBucket: process.env.FIREBASE_STORAGE_BUCKET || firebaseConfig.storageBucket,
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
     });
     console.log('Firebase Admin initialized with project:', AUTH_PROJECT_ID);
   } catch (error) {
@@ -111,21 +90,9 @@ if (!admin.apps.length) {
   }
 }
 
-// Use this project's default Firestore database — the named database id in
-// firebase-applet-config.json belongs to the other (unreachable) project.
-const rawDb = getFirestore();
-
-// --- FIREBASE AUTH TOKEN VERIFICATION ---
-// The main app above already targets the auth project, so this second named
-// app is only kept in case FIREBASE_AUTH_PROJECT_ID is ever pointed at a
-// different project again — today it's the same project as the main app.
-let authApp: admin.app.App;
-try {
-  authApp = admin.app('authApp');
-} catch {
-  authApp = admin.initializeApp({ credential: firebaseCredential, projectId: AUTH_PROJECT_ID }, 'authApp');
-}
-const firebaseAuth = admin.auth(authApp);
+// Firebase is only used for login (email/password) and file storage now —
+// all application data lives in MongoDB. See connectMongo() below.
+const firebaseAuth = admin.auth();
 
 // --- REQUIRE AUTH MIDDLEWARE ---
 // Every /api/* route (other than the health check registered above) needs a
@@ -145,7 +112,8 @@ async function requireAuth(req: express.Request, res: express.Response, next: ex
   }
 }
 
-// --- MONGODB (USER / DATA STORE) ---
+// --- MONGODB (the only database — clients, packages, activities, activity
+// files, users, tasks, and invoices all live here) ---
 const MONGODB_URI = process.env.MONGODB_URI || '';
 const MONGODB_DB = process.env.MONGODB_DB || 'agency_os';
 let mongoDb: MongoDb | null = null;
@@ -153,13 +121,13 @@ let mongoDb: MongoDb | null = null;
 async function connectMongo(): Promise<MongoDb | null> {
   if (mongoDb) return mongoDb;
   if (!MONGODB_URI) {
-    console.warn('MONGODB_URI not set — MongoDB user store is disabled.');
+    console.warn('MONGODB_URI not set — the database is disabled.');
     return null;
   }
   try {
     // family: 4 forces IPv4 — on Render, IPv6/dual-stack DNS resolution to
     // Atlas's SRV-resolved hosts can break the TLS handshake with exactly the
-    // "tlsv1 alert internal error" seen here; pinning to IPv4 avoids it.
+    // "tlsv1 alert internal error" seen there. Pinning to IPv4 avoids it.
     const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 10000, family: 4 });
     await client.connect();
     mongoDb = client.db(MONGODB_DB);
@@ -176,7 +144,7 @@ async function connectMongo(): Promise<MongoDb | null> {
 async function mongoColl(name: string) {
   const m = await connectMongo();
   if (!m) {
-    const err: any = new Error('MongoDB user/data store is unavailable');
+    const err: any = new Error('Database is unavailable');
     err.statusCode = 503;
     throw err;
   }
@@ -185,6 +153,9 @@ async function mongoColl(name: string) {
 
 // Shared error responder for the Mongo-backed routes.
 function sendError(res: express.Response, error: any) {
+  if (error?.code === 11000) {
+    return res.status(400).json({ error: 'A record with this value already exists' });
+  }
   res.status(error?.statusCode || 500).json({ error: error?.message || 'Server error' });
 }
 
@@ -203,13 +174,13 @@ function recomputeInvoiceStatus(inv: any): string {
   return 'Sent';
 }
 
-// Seed the baseline operator accounts in MongoDB if the collection is empty.
-async function seedMongoUsers() {
+// Seed the baseline operator accounts if the users collection is empty.
+async function seedDefaultUsers() {
   const m = await connectMongo();
   if (!m) return;
   const count = await m.collection('users').countDocuments();
   if (count === 0) {
-    console.log('Seeding default MongoDB users (Admin & Manager)...');
+    console.log('Seeding default users (Admin & Manager)...');
     await m.collection('users').insertMany([
       {
         id: 'u1',
@@ -230,328 +201,9 @@ async function seedMongoUsers() {
         created_at: new Date().toISOString(),
       },
     ]);
-    console.log('Default MongoDB users seeded.');
+    console.log('Default users seeded.');
   }
 }
-
-// --- RESILIENT DUAL-WRITE DATABASE PROXY ---
-// In production, a Firestore failure must surface as a real error instead of
-// silently switching to a local JSON file — Render/Railway's filesystem is
-// wiped on every redeploy, so the fallback would both lose data and mask the
-// real problem. The fallback only activates outside production.
-const FALLBACK_ENABLED = process.env.NODE_ENV !== 'production';
-let useLocalFallback = false;
-
-class LocalDatabaseFallback {
-  private filePath: string;
-  private data: {
-    clients: Record<string, any>;
-    monthly_packages: Record<string, any>;
-    activities: Record<string, any>;
-    activity_files: Record<string, any>;
-    users: Record<string, any>;
-  };
-
-  constructor() {
-    this.filePath = path.join(__dirname, 'uploads', 'local_fallback_db.json');
-    this.data = {
-      clients: {},
-      monthly_packages: {},
-      activities: {},
-      activity_files: {},
-      users: {}
-    };
-    // Ensure parent uploads folder exists before loading/saving
-    const parentDir = path.dirname(this.filePath);
-    if (!fs.existsSync(parentDir)) {
-      fs.mkdirSync(parentDir, { recursive: true });
-    }
-    this.load();
-  }
-
-  private load() {
-    if (fs.existsSync(this.filePath)) {
-      try {
-        const fileContent = fs.readFileSync(this.filePath, 'utf8');
-        this.data = JSON.parse(fileContent);
-      } catch (err) {
-        console.error('Error loading fallback JSON DB:', err);
-      }
-    } else {
-      this.save();
-    }
-  }
-
-  private save() {
-    try {
-      fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), 'utf8');
-    } catch (err) {
-      console.error('Error saving fallback JSON DB:', err);
-    }
-  }
-
-  getCollection(name: string) {
-    const coll = this.data[name as keyof typeof this.data] || {};
-    return Object.keys(coll).map(id => ({ id, ...coll[id] }));
-  }
-
-  setDocument(collectionName: string, docId: string, docData: any) {
-    if (!this.data[collectionName as keyof typeof this.data]) {
-      this.data[collectionName as keyof typeof this.data] = {};
-    }
-    this.data[collectionName as keyof typeof this.data][docId] = { ...docData };
-    this.save();
-  }
-
-  updateDocument(collectionName: string, docId: string, updateData: any) {
-    const coll = this.data[collectionName as keyof typeof this.data];
-    if (coll && coll[docId]) {
-      coll[docId] = { ...coll[docId], ...updateData };
-      this.save();
-    }
-  }
-
-  deleteDocument(collectionName: string, docId: string) {
-    const coll = this.data[collectionName as keyof typeof this.data];
-    if (coll && coll[docId]) {
-      delete coll[docId];
-      this.save();
-    }
-  }
-
-  getDocument(collectionName: string, docId: string) {
-    const coll = this.data[collectionName as keyof typeof this.data];
-    if (coll && coll[docId]) {
-      return { id: docId, exists: true, data: () => coll[docId] };
-    }
-    return { id: docId, exists: false, data: () => null };
-  }
-}
-
-const localDb = new LocalDatabaseFallback();
-
-// Check if rawDb has permissions, fallback otherwise
-async function testDbAccess() {
-  try {
-    await rawDb.collection('users').limit(1).get();
-    console.log('Successfully connected to remote Firestore. Using remote DB.');
-    useLocalFallback = false;
-  } catch (err: any) {
-    if (!FALLBACK_ENABLED) {
-      // This is a fire-and-forget boot-time probe, not an awaited request —
-      // throwing here would be an unhandled rejection that crashes the whole
-      // process. Log loudly instead; every route already has its own
-      // try/catch around Firestore calls and will surface this same error
-      // as a normal 500 per request until it's fixed.
-      console.error('Firestore connectivity check failed. API requests will fail until this is resolved:', err.message || err);
-      return;
-    }
-    console.warn('Remote Firestore is not ready yet (IAM Sync delay). Using local JSON fallback DB:', err.message || err);
-    useLocalFallback = true;
-  }
-}
-testDbAccess();
-
-const db = {
-  collection(collectionName: string) {
-    return {
-      where(field: string, op: any, val: any) {
-        return {
-          get: async () => {
-            if (!useLocalFallback) {
-              try {
-                return await rawDb.collection(collectionName).where(field, op, val).get();
-              } catch (err) {
-                if (!FALLBACK_ENABLED) throw err;
-                console.warn(`Firestore where().get() failed, falling back:`, err);
-                useLocalFallback = true;
-              }
-            }
-            const items = localDb.getCollection(collectionName);
-            const filtered = items.filter(item => {
-              if (op === '!=') {
-                return item[field] !== val;
-              }
-              if (op === '==') {
-                return item[field] === val;
-              }
-              return true;
-            });
-            return {
-              empty: filtered.length === 0,
-              docs: filtered.map(item => ({
-                id: item.id,
-                ref: {
-                  delete: async () => {
-                    localDb.deleteDocument(collectionName, item.id);
-                    if (!useLocalFallback) {
-                      try {
-                        await rawDb.collection(collectionName).doc(item.id).delete();
-                      } catch (err) {
-                        console.warn(`Firestore delete failed:`, err);
-                      }
-                    }
-                    return { success: true };
-                  }
-                },
-                data: () => {
-                  const { id, ...rest } = item;
-                  return rest;
-                }
-              }))
-            };
-          }
-        };
-      },
-      limit(val: number) {
-        return {
-          get: async () => {
-            if (!useLocalFallback) {
-              try {
-                return await rawDb.collection(collectionName).limit(val).get();
-              } catch (err) {
-                if (!FALLBACK_ENABLED) throw err;
-                console.warn(`Firestore limit().get() failed, falling back:`, err);
-                useLocalFallback = true;
-              }
-            }
-            const items = localDb.getCollection(collectionName).slice(0, val);
-            return {
-              empty: items.length === 0,
-              docs: items.map(item => ({
-                id: item.id,
-                ref: {
-                  delete: async () => {
-                    localDb.deleteDocument(collectionName, item.id);
-                    if (!useLocalFallback) {
-                      try {
-                        await rawDb.collection(collectionName).doc(item.id).delete();
-                      } catch (err) {
-                        console.warn(`Firestore delete failed:`, err);
-                      }
-                    }
-                    return { success: true };
-                  }
-                },
-                data: () => {
-                  const { id, ...rest } = item;
-                  return rest;
-                }
-              }))
-            };
-          }
-        };
-      },
-      get: async () => {
-        if (!useLocalFallback) {
-          try {
-            return await rawDb.collection(collectionName).get();
-          } catch (err) {
-            if (!FALLBACK_ENABLED) throw err;
-            console.warn(`Firestore get() failed, falling back:`, err);
-            useLocalFallback = true;
-          }
-        }
-        const items = localDb.getCollection(collectionName);
-        return {
-          empty: items.length === 0,
-          docs: items.map(item => ({
-            id: item.id,
-            ref: {
-              delete: async () => {
-                localDb.deleteDocument(collectionName, item.id);
-                if (!useLocalFallback) {
-                  try {
-                    await rawDb.collection(collectionName).doc(item.id).delete();
-                  } catch (err) {
-                    console.warn(`Firestore delete failed:`, err);
-                  }
-                }
-                return { success: true };
-              }
-            },
-            data: () => {
-              const { id, ...rest } = item;
-              return rest;
-            }
-          }))
-        };
-      },
-      doc(docId: string) {
-        return {
-          get: async () => {
-            if (!useLocalFallback) {
-              try {
-                return await rawDb.collection(collectionName).doc(docId).get();
-              } catch (err) {
-                if (!FALLBACK_ENABLED) throw err;
-                console.warn(`Firestore doc().get() failed, falling back:`, err);
-                useLocalFallback = true;
-              }
-            }
-            const doc = localDb.getDocument(collectionName, docId);
-            return {
-              exists: doc.exists,
-              ref: {
-                delete: async () => {
-                  localDb.deleteDocument(collectionName, docId);
-                  if (!useLocalFallback) {
-                    try {
-                      await rawDb.collection(collectionName).doc(docId).delete();
-                    } catch (err) {
-                      console.warn(`Firestore delete failed:`, err);
-                    }
-                  }
-                  return { success: true };
-                }
-              },
-              data: () => doc.data()
-            };
-          },
-          set: async (data: any) => {
-            if (FALLBACK_ENABLED) localDb.setDocument(collectionName, docId, data);
-            if (!useLocalFallback) {
-              try {
-                await rawDb.collection(collectionName).doc(docId).set(data);
-              } catch (err) {
-                if (!FALLBACK_ENABLED) throw err;
-                console.warn(`Firestore doc().set() failed, using fallback:`, err);
-                useLocalFallback = true;
-              }
-            }
-            return { success: true };
-          },
-          update: async (data: any) => {
-            if (FALLBACK_ENABLED) localDb.updateDocument(collectionName, docId, data);
-            if (!useLocalFallback) {
-              try {
-                await rawDb.collection(collectionName).doc(docId).update(data);
-              } catch (err) {
-                if (!FALLBACK_ENABLED) throw err;
-                console.warn(`Firestore doc().update() failed, using fallback:`, err);
-                useLocalFallback = true;
-              }
-            }
-            return { success: true };
-          },
-          delete: async () => {
-            if (FALLBACK_ENABLED) localDb.deleteDocument(collectionName, docId);
-            if (!useLocalFallback) {
-              try {
-                await rawDb.collection(collectionName).doc(docId).delete();
-              } catch (err) {
-                if (!FALLBACK_ENABLED) throw err;
-                console.warn(`Firestore doc().delete() failed, using fallback:`, err);
-                useLocalFallback = true;
-              }
-            }
-            return { success: true };
-          }
-        };
-      }
-    };
-  }
-};
 
 // Configure multer storage and validation
 const fileFilter = (req: any, file: Express.Multer.File, cb: any) => {
@@ -561,12 +213,12 @@ const fileFilter = (req: any, file: Express.Multer.File, cb: any) => {
     '.mp4', '.mov' // Videos
   ];
   const ext = path.extname(file.originalname).toLowerCase();
-  
+
   const allowedMimeTypes = [
     'image/jpeg', 'image/png', 'image/webp',
-    'application/pdf', 'application/msword', 
+    'application/pdf', 'application/msword',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    'application/vnd.ms-excel', 
+    'application/vnd.ms-excel',
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     'video/mp4', 'video/quicktime'
   ];
@@ -621,34 +273,32 @@ app.use('/api', requireAuth);
 // Read all non-deleted
 app.get('/api/clients', async (req, res) => {
   try {
-    const snapshot = await db.collection('clients').where('is_deleted', '!=', true).get();
-    const clients = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    res.json(clients);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+    const coll = await mongoColl('clients');
+    const clients = await coll.find({ is_deleted: { $ne: true } }).toArray();
+    res.json(clients.map(({ _id, ...c }) => c));
+  } catch (error) { sendError(res, error); }
 });
 
 // Read deleted as well (Admin Restore views)
 app.get('/api/clients/all', async (req, res) => {
   try {
-    const snapshot = await db.collection('clients').get();
-    const clients = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    res.json(clients);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+    const coll = await mongoColl('clients');
+    const clients = await coll.find({}).toArray();
+    res.json(clients.map(({ _id, ...c }) => c));
+  } catch (error) { sendError(res, error); }
 });
 
 // Create
 app.post('/api/clients', async (req, res) => {
   try {
+    const coll = await mongoColl('clients');
     const { client_name, logo_url, industry, start_date, status, priority } = req.body;
     if (!client_name) {
       return res.status(400).json({ error: 'Client name is required' });
     }
     const id = `c-${Date.now()}`;
     const newClient = {
+      id,
       client_name,
       logo_url: logo_url || client_name.substring(0, 2).toUpperCase(),
       industry: industry || 'Other',
@@ -659,16 +309,15 @@ app.post('/api/clients', async (req, res) => {
       deleted_at: null,
       created_at: new Date().toISOString()
     };
-    await db.collection('clients').doc(id).set(newClient);
-    res.status(211).json({ id, ...newClient });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+    await coll.insertOne({ ...newClient });
+    res.status(211).json(newClient);
+  } catch (error) { sendError(res, error); }
 });
 
 // Update
 app.put('/api/clients/:id', async (req, res) => {
   try {
+    const coll = await mongoColl('clients');
     const { id } = req.params;
     const body = req.body;
     const updateData: any = {};
@@ -677,39 +326,29 @@ app.put('/api/clients/:id', async (req, res) => {
       if (body[field] !== undefined) updateData[field] = body[field];
     });
 
-    await db.collection('clients').doc(id).update(updateData);
+    await coll.updateOne({ id }, { $set: updateData });
     res.json({ id, ...updateData });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { sendError(res, error); }
 });
 
 // Soft Delete
 app.delete('/api/clients/:id', async (req, res) => {
   try {
+    const coll = await mongoColl('clients');
     const { id } = req.params;
-    await db.collection('clients').doc(id).update({
-      is_deleted: true,
-      deleted_at: new Date().toISOString()
-    });
+    await coll.updateOne({ id }, { $set: { is_deleted: true, deleted_at: new Date().toISOString() } });
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { sendError(res, error); }
 });
 
 // Restore Client
 app.post('/api/clients/:id/restore', async (req, res) => {
   try {
+    const coll = await mongoColl('clients');
     const { id } = req.params;
-    await db.collection('clients').doc(id).update({
-      is_deleted: false,
-      deleted_at: null
-    });
+    await coll.updateOne({ id }, { $set: { is_deleted: false, deleted_at: null } });
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { sendError(res, error); }
 });
 
 
@@ -717,40 +356,38 @@ app.post('/api/clients/:id/restore', async (req, res) => {
 // List active packages
 app.get('/api/packages', async (req, res) => {
   try {
-    const snapshot = await db.collection('monthly_packages').where('is_deleted', '!=', true).get();
-    const pkgs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    res.json(pkgs);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+    const coll = await mongoColl('monthly_packages');
+    const pkgs = await coll.find({ is_deleted: { $ne: true } }).toArray();
+    res.json(pkgs.map(({ _id, ...p }) => p));
+  } catch (error) { sendError(res, error); }
 });
 
 // List all (included deleted)
 app.get('/api/packages/all', async (req, res) => {
   try {
-    const snapshot = await db.collection('monthly_packages').get();
-    const pkgs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    res.json(pkgs);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+    const coll = await mongoColl('monthly_packages');
+    const pkgs = await coll.find({}).toArray();
+    res.json(pkgs.map(({ _id, ...p }) => p));
+  } catch (error) { sendError(res, error); }
 });
 
 // Create package
 app.post('/api/packages', async (req, res) => {
   try {
-    const { 
-      client_id, month, year, 
-      posters_target, reels_target, video_target, ads_target, 
-      blogs_target, content_target, scripts_target, website_updates_target 
+    const coll = await mongoColl('monthly_packages');
+    const {
+      client_id, month, year,
+      posters_target, reels_target, video_target, ads_target,
+      blogs_target, content_target, scripts_target, website_updates_target
     } = req.body;
-    
+
     if (!client_id || !month || !year) {
       return res.status(400).json({ error: 'client_id, month, and year are required.' });
     }
 
     const id = `pkg-${Date.now()}`;
     const newPkg = {
+      id,
       client_id,
       month: Number(month),
       year: Number(year),
@@ -766,16 +403,15 @@ app.post('/api/packages', async (req, res) => {
       deleted_at: null,
       created_at: new Date().toISOString()
     };
-    await db.collection('monthly_packages').doc(id).set(newPkg);
-    res.status(211).json({ id, ...newPkg });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+    await coll.insertOne({ ...newPkg });
+    res.status(211).json(newPkg);
+  } catch (error) { sendError(res, error); }
 });
 
 // Update package
 app.put('/api/packages/:id', async (req, res) => {
   try {
+    const coll = await mongoColl('monthly_packages');
     const { id } = req.params;
     const body = req.body;
     const updateData: any = {};
@@ -789,39 +425,29 @@ app.put('/api/packages/:id', async (req, res) => {
       }
     });
 
-    await db.collection('monthly_packages').doc(id).update(updateData);
+    await coll.updateOne({ id }, { $set: updateData });
     res.json({ id, ...updateData });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { sendError(res, error); }
 });
 
 // Soft Delete package
 app.delete('/api/packages/:id', async (req, res) => {
   try {
+    const coll = await mongoColl('monthly_packages');
     const { id } = req.params;
-    await db.collection('monthly_packages').doc(id).update({
-      is_deleted: true,
-      deleted_at: new Date().toISOString()
-    });
+    await coll.updateOne({ id }, { $set: { is_deleted: true, deleted_at: new Date().toISOString() } });
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { sendError(res, error); }
 });
 
 // Restore package
 app.post('/api/packages/:id/restore', async (req, res) => {
   try {
+    const coll = await mongoColl('monthly_packages');
     const { id } = req.params;
-    await db.collection('monthly_packages').doc(id).update({
-      is_deleted: false,
-      deleted_at: null
-    });
+    await coll.updateOne({ id }, { $set: { is_deleted: false, deleted_at: null } });
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { sendError(res, error); }
 });
 
 
@@ -829,51 +455,40 @@ app.post('/api/packages/:id/restore', async (req, res) => {
 // List active activities along with associated files
 app.get('/api/activities', async (req, res) => {
   try {
-    const actSnap = await db.collection('activities').where('is_deleted', '!=', true).get();
-    const fileSnap = await db.collection('activity_files').get();
+    const actColl = await mongoColl('activities');
+    const fileColl = await mongoColl('activity_files');
+    const activities = await actColl.find({ is_deleted: { $ne: true } }).toArray();
+    const files = await fileColl.find({}).toArray();
 
     const filesMap: Record<string, any[]> = {};
-    fileSnap.docs.forEach(doc => {
-      const f = doc.data();
-      const activityId = f.activity_id;
-      if (activityId) {
-        if (!filesMap[activityId]) filesMap[activityId] = [];
-        filesMap[activityId].push({ id: doc.id, ...f });
+    files.forEach(({ _id, ...f }) => {
+      if (f.activity_id) {
+        if (!filesMap[f.activity_id]) filesMap[f.activity_id] = [];
+        filesMap[f.activity_id].push(f);
       }
     });
 
-    const activities = actSnap.docs.map(doc => {
-      const act = doc.data();
-      return {
-        id: doc.id,
-        ...act,
-        files: filesMap[doc.id] || []
-      };
-    });
-
-    res.json(activities);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+    res.json(activities.map(({ _id, ...a }) => ({ ...a, files: filesMap[a.id] || [] })));
+  } catch (error) { sendError(res, error); }
 });
 
 // List all (incl. deleted)
 app.get('/api/activities/all', async (req, res) => {
   try {
-    const snapshot = await db.collection('activities').get();
-    const activities = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    res.json(activities);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+    const coll = await mongoColl('activities');
+    const activities = await coll.find({}).toArray();
+    res.json(activities.map(({ _id, ...a }) => a));
+  } catch (error) { sendError(res, error); }
 });
 
 // Create Activity
 app.post('/api/activities', async (req, res) => {
   try {
+    const coll = await mongoColl('activities');
+    const filesColl = await mongoColl('activity_files');
     const body = req.body;
-    const { 
-      client_id, activity_type, sub_type, stage, title, description, 
+    const {
+      client_id, activity_type, sub_type, stage, title, description,
       drive_link, activity_date, created_by, remarks, blog_title, blog_url,
       client_feedback, approval_status, priority, estimated_completion, attached_files
     } = body;
@@ -882,29 +497,25 @@ app.post('/api/activities', async (req, res) => {
       return res.status(400).json({ error: 'client_id, activity_type, title, and activity_date are required' });
     }
 
-    // Auto-compute unique activity code for that year
+    // Auto-compute unique activity code for that year. Scans every activity
+    // (including soft-deleted ones) so codes are never reused.
     const actYear = activity_date.split('-')[0] || '2026';
-    
-    // Read existing codes for this year to safe-increment
-    const snapshot = await db.collection('activities').get();
+    const sameYearCodes = await coll.find({ activity_id_code: { $regex: `^ACT-${actYear}-` } }).toArray();
     let maxNum = 0;
-    snapshot.docs.forEach(doc => {
-      const code = doc.data().activity_id_code;
-      if (code && code.startsWith(`ACT-${actYear}-`)) {
-        const parts = code.split('-');
-        const num = parseInt(parts[2], 10);
-        if (!isNaN(num) && num > maxNum) {
-          maxNum = num;
-        }
+    sameYearCodes.forEach(doc => {
+      const parts = (doc.activity_id_code || '').split('-');
+      const num = parseInt(parts[2], 10);
+      if (!isNaN(num) && num > maxNum) {
+        maxNum = num;
       }
     });
 
-    const nextCounter = maxNum + 1;
-    const paddedCounter = String(nextCounter).padStart(4, '0');
+    const paddedCounter = String(maxNum + 1).padStart(4, '0');
     const activity_id_code = `ACT-${actYear}-${paddedCounter}`;
     const id = `act-${Date.now()}`;
 
     const newActivity = {
+      id,
       activity_id_code,
       client_id,
       activity_type,
@@ -927,7 +538,7 @@ app.post('/api/activities', async (req, res) => {
       created_at: new Date().toISOString()
     };
 
-    await db.collection('activities').doc(id).set(newActivity);
+    await coll.insertOne({ ...newActivity });
 
     // If there are files attached, register them in activity_files table
     const registeredFiles = [];
@@ -943,25 +554,25 @@ app.post('/api/activities', async (req, res) => {
           file_type: file.file_type,
           uploaded_at: new Date().toISOString()
         };
-        await db.collection('activity_files').doc(fileId).set(record);
+        await filesColl.insertOne({ ...record });
         registeredFiles.push(record);
       }
     }
 
-    res.status(211).json({ id, ...newActivity, files: registeredFiles });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+    res.status(211).json({ ...newActivity, files: registeredFiles });
+  } catch (error) { sendError(res, error); }
 });
 
 // Update Activity
 app.put('/api/activities/:id', async (req, res) => {
   try {
+    const coll = await mongoColl('activities');
+    const filesColl = await mongoColl('activity_files');
     const { id } = req.params;
     const body = req.body;
     const updateData: any = {};
     const editableFields = [
-      'client_id', 'activity_type', 'sub_type', 'stage', 'title', 'description', 
+      'client_id', 'activity_type', 'sub_type', 'stage', 'title', 'description',
       'drive_link', 'activity_date', 'remarks', 'blog_title', 'blog_url',
       'client_feedback', 'approval_status', 'priority', 'estimated_completion'
     ];
@@ -969,7 +580,7 @@ app.put('/api/activities/:id', async (req, res) => {
       if (body[field] !== undefined) updateData[field] = body[field];
     });
 
-    await db.collection('activities').doc(id).update(updateData);
+    await coll.updateOne({ id }, { $set: updateData });
 
     // Save newly attached files if any are sent
     const registeredFiles = [];
@@ -986,53 +597,44 @@ app.put('/api/activities/:id', async (req, res) => {
             file_type: file.file_type,
             uploaded_at: new Date().toISOString()
           };
-          await db.collection('activity_files').doc(fileId).set(record);
+          await filesColl.insertOne({ ...record });
           registeredFiles.push(record);
         }
       }
     }
 
     res.json({ id, ...updateData, newFiles: registeredFiles });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { sendError(res, error); }
 });
 
 // Soft Delete Activity
 app.delete('/api/activities/:id', async (req, res) => {
   try {
+    const coll = await mongoColl('activities');
     const { id } = req.params;
-    await db.collection('activities').doc(id).update({
-      is_deleted: true,
-      deleted_at: new Date().toISOString()
-    });
+    await coll.updateOne({ id }, { $set: { is_deleted: true, deleted_at: new Date().toISOString() } });
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { sendError(res, error); }
 });
 
 // Restore Activity
 app.post('/api/activities/:id/restore', async (req, res) => {
   try {
+    const coll = await mongoColl('activities');
     const { id } = req.params;
-    await db.collection('activities').doc(id).update({
-      is_deleted: false,
-      deleted_at: null
-    });
+    await coll.updateOne({ id }, { $set: { is_deleted: false, deleted_at: null } });
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { sendError(res, error); }
 });
 
 
 // 4. USERS CRUD (Manager and Admin users)
-// List users
 // --- AUTHENTICATION ---
 // Resolve the signed-in Firebase user to an application account in MongoDB.
 // The client sends the Firebase ID token; we verify it, then look up (or
 // lazily create) the matching user record and return it with their role.
+// This is the same `users` collection the CRUD routes below operate on, so
+// there's a single source of truth for accounts.
 app.post('/api/auth/me', async (req, res) => {
   try {
     const header = req.headers.authorization || '';
@@ -1053,12 +655,7 @@ app.post('/api/auth/me', async (req, res) => {
       return res.status(400).json({ error: 'Token has no email claim' });
     }
 
-    const m = await connectMongo();
-    if (!m) {
-      return res.status(503).json({ error: 'User store unavailable' });
-    }
-
-    const usersColl = m.collection('users');
+    const usersColl = await mongoColl('users');
     let user = await usersColl.findOne({ email });
 
     if (!user) {
@@ -1090,7 +687,7 @@ app.post('/api/auth/me', async (req, res) => {
       is_deleted: false,
     });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    sendError(res, error);
   }
 });
 
@@ -1315,91 +912,78 @@ app.post('/api/invoices/:id/payments', async (req, res) => {
 
 app.get('/api/users', async (req, res) => {
   try {
-    const snapshot = await db.collection('users').where('is_deleted', '!=', true).get();
-    const users = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    res.json(users);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+    const coll = await mongoColl('users');
+    const users = await coll.find({ is_deleted: { $ne: true } }).toArray();
+    res.json(users.map(({ _id, ...u }) => u));
+  } catch (error) { sendError(res, error); }
 });
 
 // List all including deleted users
 app.get('/api/users/all', async (req, res) => {
   try {
-    const snapshot = await db.collection('users').get();
-    const users = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    res.json(users);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+    const coll = await mongoColl('users');
+    const users = await coll.find({}).toArray();
+    res.json(users.map(({ _id, ...u }) => u));
+  } catch (error) { sendError(res, error); }
 });
 
 // Create User
 app.post('/api/users', async (req, res) => {
   try {
+    const coll = await mongoColl('users');
     const { name, email, role } = req.body;
     if (!name || !email || !role) {
       return res.status(400).json({ error: 'name, email, and role are required' });
     }
     const id = `u-${Date.now()}`;
     const newUser = {
+      id,
       name,
-      email,
+      email: String(email).toLowerCase(),
       role,
       is_deleted: false,
       deleted_at: null,
       created_at: new Date().toISOString()
     };
-    await db.collection('users').doc(id).set(newUser);
-    res.status(211).json({ id, ...newUser });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+    await coll.insertOne({ ...newUser });
+    res.status(211).json(newUser);
+  } catch (error) { sendError(res, error); }
 });
 
 // Update User
 app.put('/api/users/:id', async (req, res) => {
   try {
+    const coll = await mongoColl('users');
     const { id } = req.params;
     const { name, email, role } = req.body;
     const updateData: any = {};
     if (name !== undefined) updateData.name = name;
-    if (email !== undefined) updateData.email = email;
+    if (email !== undefined) updateData.email = String(email).toLowerCase();
     if (role !== undefined) updateData.role = role;
 
-    await db.collection('users').doc(id).update(updateData);
+    await coll.updateOne({ id }, { $set: updateData });
     res.json({ id, ...updateData });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { sendError(res, error); }
 });
 
 // Soft Delete User
 app.delete('/api/users/:id', async (req, res) => {
   try {
+    const coll = await mongoColl('users');
     const { id } = req.params;
-    await db.collection('users').doc(id).update({
-      is_deleted: true,
-      deleted_at: new Date().toISOString()
-    });
+    await coll.updateOne({ id }, { $set: { is_deleted: true, deleted_at: new Date().toISOString() } });
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { sendError(res, error); }
 });
 
 // Restore User
 app.post('/api/users/:id/restore', async (req, res) => {
   try {
+    const coll = await mongoColl('users');
     const { id } = req.params;
-    await db.collection('users').doc(id).update({
-      is_deleted: false,
-      deleted_at: null
-    });
+    await coll.updateOne({ id }, { $set: { is_deleted: false, deleted_at: null } });
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { sendError(res, error); }
 });
 
 
@@ -1407,24 +991,22 @@ app.post('/api/users/:id/restore', async (req, res) => {
 // Delete/Remove attachment
 app.delete('/api/files/:id', async (req, res) => {
   try {
+    const coll = await mongoColl('activity_files');
     const { id } = req.params;
-    const fileDoc = await db.collection('activity_files').doc(id).get();
-    if (fileDoc.exists) {
-      const docData = fileDoc.data();
+    const fileDoc = await coll.findOne({ id });
+    if (fileDoc) {
       // Remove the object from Firebase Storage
-      if (docData?.storage_path) {
+      if (fileDoc.storage_path) {
         try {
-          await getStorage().bucket().file(docData.storage_path).delete();
+          await getStorage().bucket().file(fileDoc.storage_path).delete();
         } catch (err) {
-          console.warn(`Could not delete storage object ${docData.storage_path}:`, err);
+          console.warn(`Could not delete storage object ${fileDoc.storage_path}:`, err);
         }
       }
-      await db.collection('activity_files').doc(id).delete();
+      await coll.deleteOne({ id });
     }
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { sendError(res, error); }
 });
 
 
@@ -1443,12 +1025,10 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 
     let clientSlugName = 'unnamed-client';
     if (clientId) {
-      const clientDoc = await db.collection('clients').doc(clientId).get();
-      if (clientDoc.exists) {
-        const clientData = clientDoc.data();
-        if (clientData?.client_name) {
-          clientSlugName = slugify(clientData.client_name);
-        }
+      const clientsColl = await mongoColl('clients');
+      const client = await clientsColl.findOne({ id: clientId });
+      if (client?.client_name) {
+        clientSlugName = slugify(client.client_name);
       }
     }
 
@@ -1469,7 +1049,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
       file_type: req.file.mimetype
     });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    sendError(res, error);
   }
 });
 
@@ -1482,44 +1062,27 @@ app.post('/api/reset', async (req, res) => {
   try {
     console.log('Failsafe Database Reset triggered...');
 
-    // Delete clients
-    const clientsRef = await db.collection('clients').get();
-    const clientPromises = clientsRef.docs.map(doc => doc.ref.delete());
-    
-    // Delete monthly_packages
-    const packagesRef = await db.collection('monthly_packages').get();
-    const pkgPromises = packagesRef.docs.map(doc => doc.ref.delete());
-
-    // Delete activities
-    const activitiesRef = await db.collection('activities').get();
-    const actPromises = activitiesRef.docs.map(doc => doc.ref.delete());
-
-    // Delete users except u1 and u2
-    const usersRef = await db.collection('users').get();
-    const userPromises = usersRef.docs.map(doc => {
-      if (doc.id !== 'u1' && doc.id !== 'u2') {
-        return doc.ref.delete();
-      }
-      return Promise.resolve();
-    });
-
-    // Delete upload references from activity_files
-    const filesRef = await db.collection('activity_files').get();
-    const filePromises = filesRef.docs.map(doc => doc.ref.delete());
+    const [clientsColl, pkgColl, actColl, filesColl, usersColl] = await Promise.all([
+      mongoColl('clients'),
+      mongoColl('monthly_packages'),
+      mongoColl('activities'),
+      mongoColl('activity_files'),
+      mongoColl('users'),
+    ]);
 
     await Promise.all([
-      ...clientPromises,
-      ...pkgPromises,
-      ...actPromises,
-      ...userPromises,
-      ...filePromises
+      clientsColl.deleteMany({}),
+      pkgColl.deleteMany({}),
+      actColl.deleteMany({}),
+      filesColl.deleteMany({}),
+      usersColl.deleteMany({ id: { $nin: ['u1', 'u2'] } }),
     ]);
 
     console.log('Failsafe Database Reset successfully processed.');
     res.json({ success: true, message: 'System database successfully cleared and reset to clean state.' });
   } catch (error: any) {
     console.error('Error processing failsafe reset:', error);
-    res.status(500).json({ error: error.message });
+    sendError(res, error);
   }
 });
 
@@ -1547,40 +1110,10 @@ async function startServer() {
     });
   }
 
-  // Bootstrap default users if none exist, ensuring no clients, activities, or SLA data are pre-seeded.
-  async function bootstrapDefaultUsers() {
-    try {
-      const snapshot = await db.collection('users').limit(1).get();
-      if (snapshot.empty) {
-        console.log('Bootstrapping default users (Sarah Jenkins & Alex Rivera)...');
-        await db.collection('users').doc('u1').set({
-          name: 'Sarah Jenkins',
-          email: 'admin@agency.com',
-          role: 'Admin',
-          is_deleted: false,
-          deleted_at: null,
-          created_at: new Date().toISOString()
-        });
-        await db.collection('users').doc('u2').set({
-          name: 'Alex Rivera',
-          email: 'manager@agency.com',
-          role: 'Manager',
-          is_deleted: false,
-          deleted_at: null,
-          created_at: new Date().toISOString()
-        });
-        console.log('Default users successfully bootstrapped.');
-      }
-    } catch (err) {
-      console.error('Error bootstrapping default users:', err);
-    }
-  }
-
   // Start Server listening on 0.0.0.0:3000
   app.listen(PORT, '0.0.0.0', async () => {
     console.log(`Agency Operations OS running at http://localhost:${PORT}`);
-    await bootstrapDefaultUsers();
-    await seedMongoUsers();
+    await seedDefaultUsers();
   });
 }
 
