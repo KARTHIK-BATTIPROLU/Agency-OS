@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Client, MonthlyPackage, Activity, User, UserRole, Task, Invoice, ACTIVITY_CONFIGS, isWithinAuditRange, getAuditPeriodLabel } from './types';
+import { Client, MonthlyPackage, Activity, User, UserRole, Role, Task, Invoice, ACTIVITY_CONFIGS, isWithinAuditRange, getAuditPeriodLabel } from './types';
 import Dashboard from './components/Dashboard';
 import ActivityForm from './components/ActivityForm';
 import ClientPackageConfig from './components/ClientPackageConfig';
@@ -24,6 +24,7 @@ export default function App() {
   const [packages, setPackages] = useState<MonthlyPackage[]>([]);
   const [activities, setActivities] = useState<Activity[]>([]);
   const [users, setUsers] = useState<User[]>([]);
+  const [roles, setRoles] = useState<Role[]>([]);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [invoices, setInvoices] = useState<Invoice[]>([]);
@@ -51,11 +52,12 @@ export default function App() {
   const loadAllData = async () => {
     try {
       setErrorText('');
-      const [clientsRes, packagesRes, activitiesRes, usersRes] = await Promise.all([
+      const [clientsRes, packagesRes, activitiesRes, usersRes, rolesRes] = await Promise.all([
         apiFetch('/api/clients/all'), // Get all including soft deleted for restoration
         apiFetch('/api/packages/all'),
         apiFetch('/api/activities/all'),
-        apiFetch('/api/users/all')
+        apiFetch('/api/users/all'),
+        apiFetch('/api/roles')
       ]);
 
       const failedEndpoints: string[] = [];
@@ -77,22 +79,28 @@ export default function App() {
         failedEndpoints.push('users');
         try { const errJson = await usersRes.json(); details += ` Users Error: ${errJson.error || JSON.stringify(errJson)}`; } catch { details += ' Users failed with non-JSON response.'; }
       }
+      if (!rolesRes.ok) {
+        failedEndpoints.push('roles');
+        try { const errJson = await rolesRes.json(); details += ` Roles Error: ${errJson.error || JSON.stringify(errJson)}`; } catch { details += ' Roles failed with non-JSON response.'; }
+      }
 
       if (failedEndpoints.length > 0) {
         throw new Error(`Failed to load endpoints: ${failedEndpoints.join(', ')}.${details}`);
       }
 
-      const [clientsData, packagesData, activitiesData, usersData] = await Promise.all([
+      const [clientsData, packagesData, activitiesData, usersData, rolesData] = await Promise.all([
         clientsRes.json(),
         packagesRes.json(),
         activitiesRes.json(),
-        usersRes.json()
+        usersRes.json(),
+        rolesRes.json()
       ]);
 
       setClients(clientsData);
       setPackages(packagesData);
       setActivities(activitiesData);
       setUsers(usersData);
+      setRoles(rolesData);
 
       // Resolve the signed-in identity from MongoDB. The server verifies the
       // Firebase ID token and returns the matching user record (with role).
@@ -384,7 +392,7 @@ export default function App() {
   };
 
   // Staff User actions
-  const handleSaveUser = async (userData: { id?: string, name: string, email: string, role: UserRole }) => {
+  const handleSaveUser = async (userData: { id?: string, name: string, email: string, role: UserRole, password?: string }) => {
     try {
       setLoading(true);
       const isEdit = !!userData.id;
@@ -394,7 +402,43 @@ export default function App() {
         body: JSON.stringify(userData)
       });
       if (!response.ok) {
-        throw new Error('Backend could not save user credentials.');
+        const errJson = await response.json().catch(() => ({}));
+        throw new Error(errJson.error || 'Backend could not save user credentials.');
+      }
+      await loadAllData();
+    } catch (err: any) {
+      alert(err.message);
+      setLoading(false);
+    }
+  };
+
+  const handleCreateRole = async (name: string) => {
+    try {
+      setLoading(true);
+      const response = await apiFetch('/api/roles', {
+        method: 'POST',
+        body: JSON.stringify({ name })
+      });
+      if (!response.ok) {
+        const errJson = await response.json().catch(() => ({}));
+        throw new Error(errJson.error || 'Could not create role.');
+      }
+      await loadAllData();
+    } catch (err: any) {
+      alert(err.message);
+      setLoading(false);
+    }
+  };
+
+  const handleDeleteRole = async (roleId: string) => {
+    try {
+      setLoading(true);
+      const response = await apiFetch(`/api/roles/${roleId}`, {
+        method: 'DELETE'
+      });
+      if (!response.ok) {
+        const errJson = await response.json().catch(() => ({}));
+        throw new Error(errJson.error || 'Could not delete role.');
       }
       await loadAllData();
     } catch (err: any) {
@@ -916,6 +960,7 @@ export default function App() {
               clients={clients}
               packages={packages}
               users={users}
+              roles={roles}
               currentRole={currentUser.role}
               initialClientId={preselectedClientIdForConfig}
               onSaveClient={handleSaveClient}
@@ -925,6 +970,8 @@ export default function App() {
               onSaveUser={handleSaveUser}
               onDeleteUser={handleDeleteUser}
               onRestoreUser={handleRestoreUser}
+              onCreateRole={handleCreateRole}
+              onDeleteRole={handleDeleteRole}
             />
           )}
 

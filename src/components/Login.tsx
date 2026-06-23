@@ -1,16 +1,11 @@
 import React, { useState } from 'react';
 import {
   signInWithEmailAndPassword,
-  createUserWithEmailAndPassword,
   sendPasswordResetEmail,
-  signOut,
   AuthError,
 } from 'firebase/auth';
 import { auth } from '../firebase';
-import { apiFetch } from '../lib/api';
 import { Loader2, Lock, Mail, AlertTriangle } from 'lucide-react';
-
-type AuthRole = 'Admin' | 'Manager';
 
 // Maps Firebase auth error codes to operator-friendly copy.
 function describeAuthError(code: string): string {
@@ -23,10 +18,6 @@ function describeAuthError(code: string): string {
     case 'auth/invalid-credential':
     case 'auth/wrong-password':
       return 'Incorrect email or password.';
-    case 'auth/email-already-in-use':
-      return 'An account already exists for that email.';
-    case 'auth/weak-password':
-      return 'Password should be at least 6 characters.';
     case 'auth/too-many-requests':
       return 'Too many attempts. Please wait and try again.';
     case 'auth/operation-not-allowed':
@@ -37,8 +28,6 @@ function describeAuthError(code: string): string {
 }
 
 export default function Login() {
-  const [authRole, setAuthRole] = useState<AuthRole>('Manager');
-  const [mode, setMode] = useState<'signin' | 'signup'>('signin');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -55,22 +44,7 @@ export default function Login() {
     }
     setSubmitting(true);
     try {
-      if (mode === 'signin') {
-        await signInWithEmailAndPassword(auth, email.trim(), password);
-      } else {
-        await createUserWithEmailAndPassword(auth, email.trim(), password);
-        // The Firebase account now exists; provision its MongoDB record with
-        // the role chosen on this tab before the app shell reads /api/auth/me.
-        const signupRes = await apiFetch('/api/auth/signup', {
-          method: 'POST',
-          body: JSON.stringify({ role: authRole }),
-        });
-        if (!signupRes.ok) {
-          const data = await signupRes.json().catch(() => ({}));
-          await signOut(auth);
-          throw new Error(data.error || 'Could not finish creating your account.');
-        }
-      }
+      await signInWithEmailAndPassword(auth, email.trim(), password);
       // On success the top-level auth listener swaps to the app shell.
     } catch (err) {
       if (err instanceof Error && !(err as AuthError).code) {
@@ -112,33 +86,9 @@ export default function Login() {
           </div>
         </div>
 
-        {/* Admin / Manager role tab */}
-        <div className="flex mb-6 border border-gray-200 rounded overflow-hidden">
-          {(['Admin', 'Manager'] as AuthRole[]).map((r) => (
-            <button
-              key={r}
-              type="button"
-              onClick={() => {
-                setAuthRole(r);
-                setError('');
-                setNotice('');
-              }}
-              className={`flex-1 py-2 text-[11px] font-bold uppercase tracking-widest font-mono cursor-pointer transition-colors ${
-                authRole === r ? 'bg-black text-white' : 'bg-white text-gray-400 hover:text-black'
-              }`}
-            >
-              {r}
-            </button>
-          ))}
-        </div>
-
-        <h2 className="text-lg font-bold mb-1">
-          {mode === 'signin' ? `${authRole} sign in` : `Create ${authRole} account`}
-        </h2>
+        <h2 className="text-lg font-bold mb-1">Sign in</h2>
         <p className="text-xs text-gray-500 mb-6 font-mono uppercase tracking-wide">
-          {mode === 'signin'
-            ? authRole === 'Admin' ? 'Agency owner access' : 'Account manager access'
-            : authRole === 'Admin' ? 'Register a new agency owner' : 'Register a new account manager'}
+          Use the credentials your administrator gave you
         </p>
 
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -163,7 +113,7 @@ export default function Login() {
               <Lock className="w-4 h-4 text-gray-400" />
               <input
                 type="password"
-                autoComplete={mode === 'signin' ? 'current-password' : 'new-password'}
+                autoComplete="current-password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 className="w-full py-2.5 px-2 text-sm outline-none bg-transparent"
@@ -190,29 +140,17 @@ export default function Login() {
             className="w-full bg-black hover:bg-gray-900 text-white font-bold py-2.5 px-4 rounded text-sm active:scale-95 transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
           >
             {submitting && <Loader2 className="w-4 h-4 animate-spin" />}
-            {mode === 'signin' ? 'Sign in' : 'Create account'}
+            Sign in
           </button>
         </form>
 
-        <div className="mt-6 flex items-center justify-between text-xs">
+        <div className="mt-6 flex items-center justify-end text-xs">
           <button
-            onClick={() => {
-              setMode(mode === 'signin' ? 'signup' : 'signin');
-              setError('');
-              setNotice('');
-            }}
+            onClick={handleReset}
             className="text-gray-500 hover:text-black font-semibold cursor-pointer"
           >
-            {mode === 'signin' ? 'Create an account' : 'Have an account? Sign in'}
+            Forgot password?
           </button>
-          {mode === 'signin' && (
-            <button
-              onClick={handleReset}
-              className="text-gray-500 hover:text-black font-semibold cursor-pointer"
-            >
-              Forgot password?
-            </button>
-          )}
         </div>
       </div>
     </div>

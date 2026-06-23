@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Client, MonthlyPackage, ClientStatus, User, UserRole } from '../types';
+import { Client, MonthlyPackage, ClientStatus, User, UserRole, Role } from '../types';
 import { Plus, Trash2, Edit3, Settings, ShieldAlert, Check, X, Calendar, UserCheck, RefreshCw } from 'lucide-react';
 import DeleteConfirmationModal from './DeleteConfirmationModal';
 
@@ -7,14 +7,17 @@ interface ClientPackageConfigProps {
   clients: Client[];
   packages: MonthlyPackage[];
   users: User[];
+  roles: Role[];
   currentRole: string;
   onSaveClient: (client: Omit<Client, 'created_at'> & { id?: string }) => void;
   onDeleteClient: (id: string) => void;
   onRestoreClient: (id: string) => void;
   onSavePackage: (pkg: Omit<MonthlyPackage, 'created_at'> & { id?: string }) => void;
-  onSaveUser: (user: { id?: string, name: string, email: string, role: UserRole }) => void;
+  onSaveUser: (user: { id?: string, name: string, email: string, role: UserRole, password?: string }) => void;
   onDeleteUser: (id: string) => void;
   onRestoreUser: (id: string) => void;
+  onCreateRole: (name: string) => void;
+  onDeleteRole: (id: string) => void;
   initialClientId?: string;
 }
 
@@ -22,6 +25,7 @@ export default function ClientPackageConfig({
   clients,
   packages,
   users,
+  roles,
   currentRole,
   onSaveClient,
   onDeleteClient,
@@ -30,11 +34,13 @@ export default function ClientPackageConfig({
   onSaveUser,
   onDeleteUser,
   onRestoreUser,
+  onCreateRole,
+  onDeleteRole,
   initialClientId
 }: ClientPackageConfigProps) {
   const isAdmin = currentRole === 'Admin';
 
-  const [activeTab, setActiveTab] = useState<'clients' | 'packages' | 'users'>('clients');
+  const [activeTab, setActiveTab] = useState<'clients' | 'packages' | 'users' | 'roles'>('clients');
   const [showArchived, setShowArchived] = useState(false);
 
   // Client editor states
@@ -66,7 +72,11 @@ export default function ClientPackageConfig({
   const [isAddingUser, setIsAddingUser] = useState(false);
   const [userName, setUserName] = useState('');
   const [userEmail, setUserEmail] = useState('');
-  const [userRoleLocal, setUserRoleLocal] = useState<UserRole>('Manager');
+  const [userPassword, setUserPassword] = useState('');
+  const [userRoleLocal, setUserRoleLocal] = useState<UserRole>('Admin');
+
+  // Role editor state
+  const [newRoleName, setNewRoleName] = useState('');
 
   // Reusable delete confirmation modal states
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
@@ -197,6 +207,7 @@ export default function ClientPackageConfig({
     setEditingUser(u);
     setUserName(u.name);
     setUserEmail(u.email);
+    setUserPassword('');
     setUserRoleLocal(u.role);
     setIsAddingUser(false);
   };
@@ -205,13 +216,15 @@ export default function ClientPackageConfig({
     setEditingUser(null);
     setUserName('');
     setUserEmail('');
-    setUserRoleLocal('Manager');
+    setUserPassword('');
+    setUserRoleLocal(roles.find(r => !r.is_admin)?.name || 'Admin');
     setIsAddingUser(true);
   };
 
   const handleCancelUser = () => {
     setIsAddingUser(false);
     setEditingUser(null);
+    setUserPassword('');
   };
 
   const handleSaveUserSubmit = (e: React.FormEvent) => {
@@ -221,15 +234,32 @@ export default function ClientPackageConfig({
       alert('Please fill out all user information fields.');
       return;
     }
+    if (!editingUser && userPassword.length < 6) {
+      alert('Set a password of at least 6 characters for this operator.');
+      return;
+    }
+    if (editingUser && userPassword && userPassword.length < 6) {
+      alert('New password must be at least 6 characters.');
+      return;
+    }
 
     onSaveUser({
       id: editingUser?.id,
       name: userName.trim(),
       email: userEmail.trim(),
-      role: userRoleLocal
+      role: userRoleLocal,
+      ...(userPassword ? { password: userPassword } : {})
     });
 
     handleCancelUser();
+  };
+
+  // --- Roles management handlers ---
+  const handleCreateRoleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!isAdmin || !newRoleName.trim()) return;
+    onCreateRole(newRoleName.trim());
+    setNewRoleName('');
   };
 
   // Trigger Confirmation Modal for Deletions
@@ -310,19 +340,29 @@ export default function ClientPackageConfig({
         <button
           onClick={() => setActiveTab('users')}
           className={`flex-1 min-w-[120px] py-2 text-[11px] font-bold font-mono rounded transition-all ${
-            activeTab === 'users' 
-              ? 'bg-black text-white' 
+            activeTab === 'users'
+              ? 'bg-black text-white'
               : 'text-gray-500 hover:text-black'
           }`}
         >
           OPERATIONAL STAFF (USERS)
+        </button>
+        <button
+          onClick={() => setActiveTab('roles')}
+          className={`flex-1 min-w-[120px] py-2 text-[11px] font-bold font-mono rounded transition-all ${
+            activeTab === 'roles'
+              ? 'bg-black text-white'
+              : 'text-gray-500 hover:text-black'
+          }`}
+        >
+          SYSTEM ROLES
         </button>
       </div>
 
       <div className="p-6">
         
         {/* Soft-delete toggles checkbox in header */}
-        {activeTab !== 'packages' && (
+        {(activeTab === 'clients' || activeTab === 'users') && (
           <div className="flex justify-end mb-4">
             <label className="flex items-center gap-2 cursor-pointer">
               <input
@@ -687,7 +727,7 @@ export default function ClientPackageConfig({
               )}
             </form>
           </div>
-        ) : (
+        ) : activeTab === 'users' ? (
           /* USERS Tab Content */
           <div className="space-y-6">
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between pb-3 border-b border-gray-200 gap-3">
@@ -747,9 +787,24 @@ export default function ClientPackageConfig({
                       onChange={(e) => setUserRoleLocal(e.target.value as UserRole)}
                       className="w-full bg-white border border-gray-200 rounded px-3 py-2 text-xs focus:outline-none focus:border-black font-mono font-bold"
                     >
-                      <option value="Admin">Admin (Agency Owner)</option>
-                      <option value="Manager">Social Media Manager</option>
+                      {roles.map(r => (
+                        <option key={r.id} value={r.name}>{r.name}{r.is_admin ? ' (Agency Owner)' : ''}</option>
+                      ))}
                     </select>
+                  </div>
+                  <div>
+                    <label className="block text-[10px] uppercase tracking-wider text-gray-400 font-bold font-mono mb-1">
+                      {editingUser ? 'RESET PASSWORD' : 'PASSWORD *'}
+                    </label>
+                    <input
+                      type="password"
+                      value={userPassword}
+                      onChange={(e) => setUserPassword(e.target.value)}
+                      placeholder={editingUser ? 'Leave blank to keep current password' : 'Min. 6 characters'}
+                      className="w-full bg-white border border-gray-200 rounded px-3 py-2 text-xs focus:outline-none focus:border-black font-sans font-semibold text-black"
+                      required={!editingUser}
+                      minLength={6}
+                    />
                   </div>
                 </div>
 
@@ -834,6 +889,62 @@ export default function ClientPackageConfig({
                   </div>
                 ))
               )}
+            </div>
+          </div>
+        ) : (
+          /* ROLES Tab Content */
+          <div className="space-y-6">
+            <div className="pb-3 border-b border-gray-200">
+              <h3 className="text-xs font-bold text-black font-mono uppercase tracking-wide">SYSTEM ROLES</h3>
+              <p className="text-[11px] text-gray-400 font-sans mt-0.5">
+                Admin is fixed. Custom roles are staff-level labels (same access as any other operator) for organizing your team.
+              </p>
+            </div>
+
+            <form onSubmit={handleCreateRoleSubmit} className="flex flex-wrap items-end gap-3 bg-gray-50 p-4 rounded border border-gray-200">
+              <div className="flex-1 min-w-[200px]">
+                <label className="block text-[10px] uppercase tracking-wider text-gray-400 font-bold font-mono mb-1">NEW ROLE NAME *</label>
+                <input
+                  type="text"
+                  value={newRoleName}
+                  onChange={(e) => setNewRoleName(e.target.value)}
+                  placeholder="e.g. Designer"
+                  className="w-full bg-white border border-gray-200 rounded px-3 py-2 text-xs focus:outline-none focus:border-black font-sans font-semibold text-black"
+                />
+              </div>
+              <button
+                type="submit"
+                className="px-4 py-2 bg-black border border-black text-white rounded text-xs flex items-center gap-1 font-mono font-bold hover:bg-neutral-850 transition shadow-xs"
+              >
+                <Plus className="w-3.5 h-3.5" /> CREATE ROLE
+              </button>
+            </form>
+
+            <div className="space-y-3">
+              {roles.map(r => (
+                <div
+                  key={r.id}
+                  className="border border-gray-200 p-4 rounded flex justify-between items-center bg-white"
+                >
+                  <div className="flex items-center gap-2">
+                    <h4 className="text-sm font-bold text-black">{r.name}</h4>
+                    {r.is_system && (
+                      <span className="text-[9px] uppercase font-mono px-1.5 py-0.2 border rounded font-semibold text-neutral-600 bg-neutral-100">
+                        SYSTEM
+                      </span>
+                    )}
+                  </div>
+                  {!r.is_system && (
+                    <button
+                      onClick={() => onDeleteRole(r.id)}
+                      type="button"
+                      className="p-1 px-3 text-xs text-red-600 hover:bg-red-50 hover:text-red-700 border border-transparent rounded flex items-center gap-1 transition-all cursor-pointer font-bold font-mono"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> DELETE
+                    </button>
+                  )}
+                </div>
+              ))}
             </div>
           </div>
         )}

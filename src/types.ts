@@ -3,7 +3,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-export type UserRole = 'Admin' | 'Manager';
+// 'Admin' is the one fixed, privileged role. Any other value is a custom
+// role name (see Role below) — all of them carry the same staff-level access.
+export type UserRole = string;
+
+export interface Role {
+  id: string;
+  name: string;
+  is_admin: boolean;
+  is_system: boolean;
+  created_at: string;
+}
 
 export interface User {
   id: string;

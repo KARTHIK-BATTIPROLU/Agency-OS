@@ -112,6 +112,24 @@ async function requireAuth(req: express.Request, res: express.Response, next: ex
   }
 }
 
+// --- REQUIRE ADMIN MIDDLEWARE ---
+// Account/role management is Admin-only. Resolves the caller's app-level user
+// record from their verified Firebase identity and rejects non-Admins.
+async function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
+  try {
+    const email = ((req as any).firebaseUser?.email || '').toLowerCase();
+    const usersColl = await mongoColl('users');
+    const appUser = await usersColl.findOne({ email });
+    if (!appUser || appUser.is_deleted || appUser.role !== 'Admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    (req as any).appUser = appUser;
+    next();
+  } catch (error: any) {
+    sendError(res, error);
+  }
+}
+
 // --- MONGODB (the only database — clients, packages, activities, activity
 // files, users, tasks, and invoices all live here) ---
 const MONGODB_URI = process.env.MONGODB_URI || '';
@@ -174,34 +192,61 @@ function recomputeInvoiceStatus(inv: any): string {
   return 'Sent';
 }
 
-// Seed the baseline operator accounts if the users collection is empty.
+// Seed the one fixed system role if the roles collection is empty. Custom
+// roles are created by Admins afterward via POST /api/roles.
+async function seedDefaultRoles() {
+  const m = await connectMongo();
+  if (!m) return;
+  const count = await m.collection('roles').countDocuments();
+  if (count === 0) {
+    await m.collection('roles').insertOne({
+      id: 'role-admin',
+      name: 'Admin',
+      is_admin: true,
+      is_system: true,
+      created_at: new Date().toISOString(),
+    });
+  }
+}
+
+// Seed a single bootstrap Admin account — both the Mongo record and a real
+// Firebase Auth login — if the users collection is empty. Account creation
+// is otherwise Admin-only (see POST /api/users), so this is the one way in
+// on a fresh database. Change this password immediately after first login.
+const ADMIN_STARTER_PASSWORD = process.env.ADMIN_STARTER_PASSWORD || 'ChangeMe123!';
+
 async function seedDefaultUsers() {
   const m = await connectMongo();
   if (!m) return;
   const count = await m.collection('users').countDocuments();
   if (count === 0) {
-    console.log('Seeding default users (Admin & Manager)...');
-    await m.collection('users').insertMany([
-      {
-        id: 'u1',
-        name: 'Sarah Jenkins',
-        email: 'admin@agency.com',
-        role: 'Admin',
-        is_deleted: false,
-        deleted_at: null,
-        created_at: new Date().toISOString(),
-      },
-      {
-        id: 'u2',
-        name: 'Alex Rivera',
-        email: 'manager@agency.com',
-        role: 'Manager',
-        is_deleted: false,
-        deleted_at: null,
-        created_at: new Date().toISOString(),
-      },
-    ]);
-    console.log('Default users seeded.');
+    const email = 'admin@agency.com';
+    const name = 'Sarah Jenkins';
+    console.log('Seeding bootstrap Admin account...');
+
+    let uid: string;
+    try {
+      const created = await firebaseAuth.createUser({ email, password: ADMIN_STARTER_PASSWORD, displayName: name });
+      uid = created.uid;
+    } catch (err: any) {
+      if (err.code === 'auth/email-already-exists') {
+        uid = (await firebaseAuth.getUserByEmail(email)).uid;
+      } else {
+        throw err;
+      }
+    }
+
+    await m.collection('users').insertOne({
+      id: 'u1',
+      name,
+      email,
+      role: 'Admin',
+      firebase_uid: uid,
+      is_deleted: false,
+      deleted_at: null,
+      created_at: new Date().toISOString(),
+    });
+    console.log(`Bootstrap Admin seeded — log in with ${email} / ${ADMIN_STARTER_PASSWORD} and change the password immediately.`);
   }
 }
 
@@ -659,10 +704,9 @@ app.post('/api/auth/me', async (req, res) => {
     const user = await usersColl.findOne({ email });
 
     if (!user) {
-      // The account record is created explicitly by /api/auth/signup at
-      // signup time, with the role the operator chose there. If it's
-      // missing, this Firebase identity never completed signup.
-      return res.status(404).json({ error: 'No account found for this identity. Please sign up.' });
+      // Accounts are provisioned exclusively by an Admin via POST /api/users.
+      // A missing record means this Firebase identity was never registered.
+      return res.status(404).json({ error: 'No account found for this identity. Contact an administrator.' });
     }
     if (user.is_deleted) {
       return res.status(403).json({ error: 'This account has been deactivated' });
@@ -681,73 +725,8 @@ app.post('/api/auth/me', async (req, res) => {
   }
 });
 
-// Provision the MongoDB account for a freshly-created Firebase identity.
-// The operator picks their role (Admin or Manager) on the signup form, and
-// that's the role this record is created with — there's no later upgrade
-// path other than an existing Admin editing the user record.
-app.post('/api/auth/signup', async (req, res) => {
-  try {
-    const header = req.headers.authorization || '';
-    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-    if (!token) {
-      return res.status(401).json({ error: 'Missing bearer token' });
-    }
-
-    let decoded;
-    try {
-      decoded = await firebaseAuth.verifyIdToken(token);
-    } catch (err: any) {
-      return res.status(401).json({ error: 'Invalid or expired token', details: err.message });
-    }
-
-    const email = (decoded.email || '').toLowerCase();
-    if (!email) {
-      return res.status(400).json({ error: 'Token has no email claim' });
-    }
-
-    const role = req.body?.role;
-    if (role !== 'Admin' && role !== 'Manager') {
-      return res.status(400).json({ error: "Role must be 'Admin' or 'Manager'" });
-    }
-
-    const usersColl = await mongoColl('users');
-    const existing = await usersColl.findOne({ email });
-    if (existing) {
-      // Idempotent: a retried signup call returns the record already made.
-      return res.json({
-        id: existing.id,
-        name: existing.name,
-        email: existing.email,
-        role: existing.role,
-        created_at: existing.created_at,
-        is_deleted: !!existing.is_deleted,
-      });
-    }
-
-    const newUser = {
-      id: `u-${Date.now()}`,
-      name: decoded.name || email.split('@')[0],
-      email,
-      role,
-      firebase_uid: decoded.uid,
-      is_deleted: false,
-      deleted_at: null,
-      created_at: new Date().toISOString(),
-    };
-    await usersColl.insertOne(newUser as any);
-
-    res.json({
-      id: newUser.id,
-      name: newUser.name,
-      email: newUser.email,
-      role: newUser.role,
-      created_at: newUser.created_at,
-      is_deleted: false,
-    });
-  } catch (error: any) {
-    sendError(res, error);
-  }
-});
+// NOTE: self-service signup has been removed. Accounts (and their Firebase
+// Auth login) are created exclusively by an Admin via POST /api/users below.
 
 // =====================================================================
 // TASKS (MongoDB) — assignment, ownership & approval workflow
@@ -985,38 +964,113 @@ app.get('/api/users/all', async (req, res) => {
   } catch (error) { sendError(res, error); }
 });
 
-// Create User
-app.post('/api/users', async (req, res) => {
+// A role is valid if it's the fixed Admin role or an existing custom role.
+async function isValidRole(role: string): Promise<boolean> {
+  if (role === 'Admin') return true;
+  const rolesColl = await mongoColl('roles');
+  return !!(await rolesColl.findOne({ name: role }));
+}
+
+// Create User — Admin-only. Provisions a real Firebase Auth login with the
+// password the Admin sets, then records the matching app user in Mongo.
+app.post('/api/users', requireAdmin, async (req, res) => {
   try {
-    const coll = await mongoColl('users');
-    const { name, email, role } = req.body;
-    if (!name || !email || !role) {
-      return res.status(400).json({ error: 'name, email, and role are required' });
+    const { name, email, password, role } = req.body;
+    if (!name || !email || !password || !role) {
+      return res.status(400).json({ error: 'name, email, password, and role are required' });
     }
+    if (String(password).length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+    if (!(await isValidRole(role))) {
+      return res.status(400).json({ error: `Unknown role '${role}'` });
+    }
+
+    const normalizedEmail = String(email).toLowerCase();
+    const coll = await mongoColl('users');
+
+    let firebaseUid: string;
+    try {
+      const created = await firebaseAuth.createUser({ email: normalizedEmail, password, displayName: name });
+      firebaseUid = created.uid;
+    } catch (err: any) {
+      if (err.code === 'auth/email-already-exists') {
+        return res.status(400).json({ error: 'A login already exists for this email' });
+      }
+      throw err;
+    }
+
     const id = `u-${Date.now()}`;
     const newUser = {
       id,
       name,
-      email: String(email).toLowerCase(),
+      email: normalizedEmail,
       role,
+      firebase_uid: firebaseUid,
       is_deleted: false,
       deleted_at: null,
       created_at: new Date().toISOString()
     };
-    await coll.insertOne({ ...newUser });
-    res.status(211).json(newUser);
+    try {
+      await coll.insertOne({ ...newUser });
+    } catch (err) {
+      // Don't leave an orphaned Firebase login with no app record behind.
+      await firebaseAuth.deleteUser(firebaseUid).catch(() => {});
+      throw err;
+    }
+    res.status(201).json(newUser);
   } catch (error) { sendError(res, error); }
 });
 
-// Update User
-app.put('/api/users/:id', async (req, res) => {
+// Update User — Admin-only. Optionally resets the operator's password.
+app.put('/api/users/:id', requireAdmin, async (req, res) => {
   try {
     const coll = await mongoColl('users');
     const { id } = req.params;
-    const { name, email, role } = req.body;
+    const { name, email, role, password } = req.body;
+
+    if (role !== undefined && !(await isValidRole(role))) {
+      return res.status(400).json({ error: `Unknown role '${role}'` });
+    }
+
+    const target = await coll.findOne({ id });
+    if (!target) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const normalizedEmail = email !== undefined ? String(email).toLowerCase() : undefined;
+    const emailChanged = normalizedEmail !== undefined && normalizedEmail !== target.email;
+
+    if (password !== undefined && password !== '') {
+      if (String(password).length < 6) {
+        return res.status(400).json({ error: 'Password must be at least 6 characters' });
+      }
+      if (!target.firebase_uid) {
+        return res.status(400).json({ error: 'This account has no linked login to reset' });
+      }
+      await firebaseAuth.updateUser(target.firebase_uid, { password });
+    }
+
+    // Keep the Firebase Auth login in sync — the app resolves identity by
+    // email (see /api/auth/me), so letting these drift apart would lock the
+    // operator out under their old email while the new one has no login.
+    if (emailChanged) {
+      if (!target.firebase_uid) {
+        return res.status(400).json({ error: 'This account has no linked login to update' });
+      }
+      try {
+        await firebaseAuth.updateUser(target.firebase_uid, { email: normalizedEmail });
+      } catch (err: any) {
+        if (err.code === 'auth/email-already-exists') {
+          return res.status(400).json({ error: 'A login already exists for this email' });
+        }
+        throw err;
+      }
+    }
+
     const updateData: any = {};
     if (name !== undefined) updateData.name = name;
-    if (email !== undefined) updateData.email = String(email).toLowerCase();
+    if (normalizedEmail !== undefined) updateData.email = normalizedEmail;
     if (role !== undefined) updateData.role = role;
 
     await coll.updateOne({ id }, { $set: updateData });
@@ -1024,8 +1078,8 @@ app.put('/api/users/:id', async (req, res) => {
   } catch (error) { sendError(res, error); }
 });
 
-// Soft Delete User
-app.delete('/api/users/:id', async (req, res) => {
+// Soft Delete User — Admin-only.
+app.delete('/api/users/:id', requireAdmin, async (req, res) => {
   try {
     const coll = await mongoColl('users');
     const { id } = req.params;
@@ -1034,12 +1088,71 @@ app.delete('/api/users/:id', async (req, res) => {
   } catch (error) { sendError(res, error); }
 });
 
-// Restore User
-app.post('/api/users/:id/restore', async (req, res) => {
+// Restore User — Admin-only.
+app.post('/api/users/:id/restore', requireAdmin, async (req, res) => {
   try {
     const coll = await mongoColl('users');
     const { id } = req.params;
     await coll.updateOne({ id }, { $set: { is_deleted: false, deleted_at: null } });
+    res.json({ success: true, id });
+  } catch (error) { sendError(res, error); }
+});
+
+// 4b. ROLES — the fixed "Admin" role plus Admin-created custom roles. Every
+// custom role carries the same (non-Admin) access level; they only exist to
+// give staff accounts a meaningful label instead of being stuck with "Manager".
+app.get('/api/roles', async (req, res) => {
+  try {
+    const coll = await mongoColl('roles');
+    const roles = await coll.find({}).sort({ is_system: -1, name: 1 }).toArray();
+    res.json(roles.map(({ _id, ...r }) => r));
+  } catch (error) { sendError(res, error); }
+});
+
+app.post('/api/roles', requireAdmin, async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+    const trimmed = String(name).trim();
+    if (trimmed.toLowerCase() === 'admin') {
+      return res.status(400).json({ error: "'Admin' is a reserved system role" });
+    }
+    const coll = await mongoColl('roles');
+    const existing = await coll.findOne({ name: { $regex: `^${trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } });
+    if (existing) {
+      return res.status(400).json({ error: 'A role with this name already exists' });
+    }
+    const newRole = {
+      id: `role-${Date.now()}`,
+      name: trimmed,
+      is_admin: false,
+      is_system: false,
+      created_at: new Date().toISOString(),
+    };
+    await coll.insertOne({ ...newRole });
+    res.status(201).json(newRole);
+  } catch (error) { sendError(res, error); }
+});
+
+app.delete('/api/roles/:id', requireAdmin, async (req, res) => {
+  try {
+    const coll = await mongoColl('roles');
+    const { id } = req.params;
+    const role = await coll.findOne({ id });
+    if (!role) {
+      return res.status(404).json({ error: 'Role not found' });
+    }
+    if (role.is_system) {
+      return res.status(400).json({ error: 'The Admin system role cannot be deleted' });
+    }
+    const usersColl = await mongoColl('users');
+    const inUse = await usersColl.countDocuments({ role: role.name, is_deleted: { $ne: true } });
+    if (inUse > 0) {
+      return res.status(400).json({ error: `${inUse} user(s) still have this role assigned. Reassign them first.` });
+    }
+    await coll.deleteOne({ id });
     res.json({ success: true, id });
   } catch (error) { sendError(res, error); }
 });
@@ -1171,6 +1284,7 @@ async function startServer() {
   // Start Server listening on 0.0.0.0:3000
   app.listen(PORT, '0.0.0.0', async () => {
     console.log(`Agency Operations OS running at http://localhost:${PORT}`);
+    await seedDefaultRoles();
     await seedDefaultUsers();
   });
 }
