@@ -1,6 +1,13 @@
 import { getAuth } from 'firebase/auth';
 
-const BASE = import.meta.env.VITE_API_URL ?? '';
+export const BASE = import.meta.env.VITE_API_URL ?? '';
+
+// Resolves a file_path returned by the API into an absolute URL. New uploads
+// return a relative /api/files/download/<id> path; since the frontend and
+// backend can be on different origins in production, BASE must be prepended.
+export function fileUrl(path: string): string {
+  return /^https?:\/\//.test(path) ? path : `${BASE}${path}`;
+}
 
 export async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const user = getAuth().currentUser;

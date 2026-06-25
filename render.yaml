@@ -18,16 +18,13 @@ services:
       # files, users, tasks, and invoices all live here.
       - key: MONGODB_URI
         sync: false
-      # Firebase is used ONLY for login (email/password) and file storage.
+      # Firebase is used ONLY for login (email/password). Uploaded files live
+      # in MongoDB GridFS, not Firebase Storage.
       - key: FIREBASE_AUTH_PROJECT_ID
         sync: false
       # Base64-encoded service account JSON for the agency-os-sla-72519 project —
-      # required off-GCP so firebase-admin can authenticate Auth tokens and
-      # write to Storage.
+      # required off-GCP so firebase-admin can authenticate Auth tokens.
       - key: FIREBASE_SERVICE_ACCOUNT
-        sync: false
-      # Same project as the service account above (agency-os-sla-72519.firebasestorage.app).
-      - key: FIREBASE_STORAGE_BUCKET
         sync: false
       # Comma-separated list of allowed browser origins for direct CORS calls,
       # e.g. https://your-site.netlify.app — never set to "*" in production.

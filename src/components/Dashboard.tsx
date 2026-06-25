@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Client, MonthlyPackage, Activity, ACTIVITY_CONFIGS, ActivityType, isWithinAuditRange, getAuditPeriodLabel, ASSET_KEYS } from '../types';
+import { fileUrl } from '../lib/api';
 import { 
   Users, CheckCircle2, AlertTriangle, TrendingUp, Search, Filter, 
   ExternalLink, Calendar, ChevronRight, Activity as ActivityIcon, 
@@ -632,7 +633,7 @@ export default function Dashboard({
                             <React.Fragment key={file.id || fIdx}>
                               <span>•</span>
                               <a
-                                href={file.file_path}
+                                href={fileUrl(file.file_path)}
                                 download={file.file_name}
                                 target="_blank"
                                 referrerPolicy="no-referrer"
@@ -864,7 +865,7 @@ export default function Dashboard({
                             <React.Fragment key={file.id || fIdx}>
                               <span>•</span>
                               <a
-                                href={file.file_path}
+                                href={fileUrl(file.file_path)}
                                 download={file.file_name}
                                 target="_blank"
                                 referrerPolicy="no-referrer"
@@ -1063,7 +1064,7 @@ export default function Dashboard({
                               {act.files && act.files.map((file, fIdx) => (
                                 <a
                                   key={file.id || fIdx}
-                                  href={file.file_path}
+                                  href={fileUrl(file.file_path)}
                                   download={file.file_name}
                                   target="_blank"
                                   referrerPolicy="no-referrer"

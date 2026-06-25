@@ -3,8 +3,7 @@ import express from 'express';
 import path from 'path';
 import multer from 'multer';
 import admin from 'firebase-admin';
-import { MongoClient, Db as MongoDb } from 'mongodb';
-import { getStorage } from 'firebase-admin/storage';
+import { MongoClient, Db as MongoDb, GridFSBucket, ObjectId } from 'mongodb';
 import { createServer as createViteServer } from 'vite';
 
 // Suppress experimental warnings if any
@@ -65,7 +64,7 @@ app.get('/healthz', (_req, res) => res.status(200).json({ ok: true }));
 
 app.use(express.json());
 
-// --- FIREBASE ADMIN CREDENTIALS (Auth + Storage only — no Firestore) ---
+// --- FIREBASE ADMIN CREDENTIALS (Auth only — no Firestore, no Storage) ---
 // admin.initializeApp() with no `credential` falls back to Application Default
 // Credentials, which only resolves automatically on Google Cloud (via the
 // metadata service). Off-GCP hosts (Render, Railway, etc.) need an explicit
@@ -83,7 +82,6 @@ if (!admin.apps.length) {
     admin.initializeApp({
       credential: firebaseCredential,
       projectId: AUTH_PROJECT_ID,
-      storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
     });
     console.log('Firebase Admin initialized with project:', AUTH_PROJECT_ID);
   } catch (error) {
@@ -91,8 +89,8 @@ if (!admin.apps.length) {
   }
 }
 
-// Firebase is only used for login (email/password) and file storage now —
-// all application data lives in MongoDB. See connectMongo() below.
+// Firebase is only used for login (email/password) now — all application
+// data and uploaded files live in MongoDB. See connectMongo() below.
 const firebaseAuth = admin.auth();
 
 // --- REQUIRE AUTH MIDDLEWARE ---
@@ -168,6 +166,20 @@ async function mongoColl(name: string) {
     throw err;
   }
   return m.collection(name);
+}
+
+// Returns the GridFS bucket used for uploaded activity files, or throws a
+// 503-style error if the database is unavailable. Mirrors mongoColl().
+let gridBucket: GridFSBucket | null = null;
+async function mongoBucket(): Promise<GridFSBucket> {
+  const m = await connectMongo();
+  if (!m) {
+    const err: any = new Error('Database is unavailable');
+    err.statusCode = 503;
+    throw err;
+  }
+  if (!gridBucket) gridBucket = new GridFSBucket(m, { bucketName: 'activity_files' });
+  return gridBucket;
 }
 
 // Shared error responder for the Mongo-backed routes.
@@ -310,6 +322,36 @@ const upload = multer({
   storage: multer.memoryStorage(),
   fileFilter,
   limits: { fileSize: 100 * 1024 * 1024 } // Maximum 100MB per file
+});
+
+// --- ACTIVITY FILE DOWNLOADS (public, unauthenticated) ---
+// Registered before requireAuth so plain <a href> downloads work with no
+// Authorization header — same posture as the old long-lived Firebase signed
+// URLs this replaces (anyone with the link can fetch it).
+app.get('/api/files/download/:id', async (req, res) => {
+  let _id: ObjectId;
+  try {
+    _id = new ObjectId(req.params.id);
+  } catch {
+    return res.status(400).json({ error: 'Invalid file id' });
+  }
+  try {
+    const bucket = await mongoBucket();
+    const files = await bucket.find({ _id }).toArray();
+    if (!files.length) return res.status(404).json({ error: 'File not found' });
+    const meta = files[0];
+    res.setHeader('Content-Type', meta.metadata?.contentType || 'application/octet-stream');
+    const safeName = encodeURIComponent(meta.metadata?.originalName || meta.filename || 'download');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}"; filename*=UTF-8''${safeName}`);
+    const stream = bucket.openDownloadStream(_id);
+    stream.on('error', (err: any) => {
+      if (!res.headersSent) res.status(err?.code === 'ENOENT' ? 404 : 500).json({ error: 'Could not read file' });
+      else res.destroy();
+    });
+    stream.pipe(res);
+  } catch (error) {
+    sendError(res, error);
+  }
 });
 
 // --- API ROUTES ---
@@ -1167,10 +1209,12 @@ app.delete('/api/files/:id', async (req, res) => {
     const { id } = req.params;
     const fileDoc = await coll.findOne({ id });
     if (fileDoc) {
-      // Remove the object from Firebase Storage
-      if (fileDoc.storage_path) {
+      // Remove the object from GridFS. Pre-migration docs may still carry an
+      // old GCS path string in storage_path — skip those rather than throw.
+      if (fileDoc.storage_path && ObjectId.isValid(fileDoc.storage_path)) {
         try {
-          await getStorage().bucket().file(fileDoc.storage_path).delete();
+          const bucket = await mongoBucket();
+          await bucket.delete(new ObjectId(fileDoc.storage_path));
         } catch (err) {
           console.warn(`Could not delete storage object ${fileDoc.storage_path}:`, err);
         }
@@ -1184,7 +1228,7 @@ app.delete('/api/files/:id', async (req, res) => {
 
 // 6. GENERAL FILE UPLOAD API
 // Files are buffered in memory by multer (see `upload` above) and streamed
-// straight to Firebase Storage — local disk does not survive a Render/Railway
+// straight to MongoDB GridFS — local disk does not survive a Render/Railway
 // redeploy, so files are never written to this server's filesystem.
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   try {
@@ -1210,14 +1254,20 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     const cleanBaseName = req.file.originalname.replace(ext, '').replace(/[^a-zA-Z0-9]/g, '_');
     const storagePath = `clients/${clientSlugName}/${folderName}/${cleanBaseName}-${uniqueSuffix}${ext}`;
 
-    const bucketFile = getStorage().bucket().file(storagePath);
-    await bucketFile.save(req.file.buffer, { contentType: req.file.mimetype });
-    const [url] = await bucketFile.getSignedUrl({ action: 'read', expires: Date.now() + 1000 * 60 * 60 * 24 * 365 * 10 });
+    const bucket = await mongoBucket();
+    const uploadStream = bucket.openUploadStream(storagePath, {
+      metadata: { contentType: req.file.mimetype, originalName: req.file.originalname }
+    });
+    await new Promise<void>((resolve, reject) => {
+      uploadStream.on('error', reject);
+      uploadStream.on('finish', () => resolve());
+      uploadStream.end(req.file!.buffer);
+    });
 
     res.json({
       file_name: req.file.originalname,
-      file_path: url,
-      storage_path: storagePath,
+      file_path: `/api/files/download/${uploadStream.id.toString()}`,
+      storage_path: uploadStream.id.toString(),
       file_type: req.file.mimetype
     });
   } catch (error: any) {
